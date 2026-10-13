@@ -1,0 +1,8 @@
+{
+	"name": "fox-tests",
+	"type": "executable",
+	"sources": ["src"],
+	"output": "bin/fox-tests",
+	"optimize": 2,
+	"dependencies": ["../Fox"]
+}

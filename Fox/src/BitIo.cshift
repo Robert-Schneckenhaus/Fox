@@ -1,0 +1,279 @@
+namespace FoxCompression;
+
+using System;
+
+// Growable byte output with a bit writer. Bits are written from the lowest bit on (like deflate), so a decoder can
+// look up the next code with `bits & mask`.
+struct _BitWriter
+{
+    uint8[] Data;
+    int Count;
+    uint64 Bits;
+    int BitCount;
+
+    static _BitWriter Create(int capacity)
+    {
+        return _BitWriter { Data = new uint8[capacity < 64 ? 64 : capacity] };
+    }
+
+    // Starts over without giving the buffer back.
+    void Reset()
+    {
+        Count = 0;
+        Bits = 0;
+        BitCount = 0;
+    }
+
+    // Writes the lowest `count` bits of `value` (count 0 to 32).
+    void Put(uint32 value, int count)
+    {
+        Bits |= (uint64)value << BitCount;
+        BitCount += count;
+        if (BitCount >= 32)
+        {
+            if (Count + 4 > Data.Length)
+                _Grow(4);
+            Data[Count] = (uint8)(Bits & 0xFF);
+            Data[Count + 1] = (uint8)((Bits >> 8) & 0xFF);
+            Data[Count + 2] = (uint8)((Bits >> 16) & 0xFF);
+            Data[Count + 3] = (uint8)((Bits >> 24) & 0xFF);
+            Count += 4;
+            Bits >>= 32;
+            BitCount -= 32;
+        }
+    }
+
+    // Writes the bits that are left, filled up with zeros to a whole byte.
+    void Align()
+    {
+        while (BitCount > 0)
+        {
+            if (Count + 1 > Data.Length)
+                _Grow(1);
+            Data[Count] = (uint8)(Bits & 0xFF);
+            Count += 1;
+            Bits >>= 8;
+            BitCount = BitCount > 8 ? BitCount - 8 : 0;
+        }
+        Bits = 0;
+    }
+
+    // A byte at a byte boundary (after Align).
+    void PutByte(int value)
+    {
+        if (Count + 1 > Data.Length)
+            _Grow(1);
+        Data[Count] = (uint8)value;
+        Count += 1;
+    }
+
+    // An unsigned LEB128 number at a byte boundary.
+    void PutVarint(int64 value)
+    {
+        uint64 v = (uint64)value;
+        while (v >= 0x80)
+        {
+            PutByte((int)(v & 0x7F) | 0x80);
+            v >>= 7;
+        }
+        PutByte((int)v);
+    }
+
+    unsafe void PutBytes(ReadOnlySlice<uint8> data, int start, int count)
+    {
+        if (count <= 0)
+            return;
+        Reserve(count);
+        uint8* to = Data[Count..].Ptr();
+        uint8* from = data.Ptr() + start;
+        for (var i = 0; i < count; i += 1)
+            to[i] = from[i];
+        Count += count;
+    }
+
+    // Makes room for `count` more bytes.
+    void Reserve(int count)
+    {
+        if (Count + count > Data.Length)
+            _Grow(count);
+    }
+
+    uint8[] ToArray()
+    {
+        Align();
+        var result = new uint8[Count];
+        Array.Copy(Data, 0, result, 0, Count);
+        return result;
+    }
+
+    void _Grow(int count)
+    {
+        int size = Data.Length * 2;
+        if (size < Count + count)
+            size = Count + count;
+        var bigger = new uint8[size];
+        Array.Copy(Data, 0, bigger, 0, Count);
+        Data = bigger;
+    }
+}
+
+// Reads bits from the lowest on. Behind the end it reads zeros and counts them in Overrun, so the hot loop needs no
+// end check; the caller checks Overrun once at the end of a block.
+struct _BitReader
+{
+    ReadOnlySlice<uint8> Data;
+    int Pos;
+    uint64 Bits;
+    int BitCount;
+    int Overrun;
+
+    void Fill()
+    {
+        while (BitCount <= 56)
+        {
+            uint64 b = 0;
+            if (Pos < Data.Length)
+                b = Data[Pos];
+            else
+                Overrun += 1;
+            Pos += 1;
+            Bits |= b << BitCount;
+            BitCount += 8;
+        }
+    }
+
+    // The next `count` bits (0 to 32).
+    uint32 Take(int count)
+    {
+        if (BitCount < count)
+            Fill();
+        uint32 value = (uint32)(Bits & ((1ul << count) - 1));
+        Bits >>= count;
+        BitCount -= count;
+        return value;
+    }
+
+    // True when more bits were used than the data has.
+    bool PastEnd()
+    {
+        return Overrun * 8 > BitCount;
+    }
+}
+
+// Reads unsigned LEB128 numbers and single bytes from a byte position.
+struct _ByteReader
+{
+    ReadOnlySlice<uint8> Data;
+    int Pos;
+
+    // The next byte, or -1 at the end.
+    int Byte()
+    {
+        if (Pos >= Data.Length)
+            return -1;
+        int b = Data[Pos];
+        Pos += 1;
+        return b;
+    }
+
+    // The next number, or -1 if the data ends or the number has more than 63 bits.
+    int64 Varint()
+    {
+        int64 value = 0;
+        int shift = 0;
+        while (true)
+        {
+            int b = Byte();
+            if (b < 0 || shift > 56)
+                return -1;
+            value |= (int64)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+                return value;
+            shift += 7;
+        }
+        return -1;
+    }
+}
+
+// A bit writer on a buffer that has enough room (checked by the caller), kept in locals in the hot loop.
+struct _FastWriter
+{
+    uint8* P;
+    int Count;
+    uint64 Bits;
+    int BitCount;
+
+    unsafe void Put(uint32 value, int count)
+    {
+        Bits |= (uint64)value << BitCount;
+        BitCount += count;
+        if (BitCount >= 32)
+        {
+            uint8* p = P + Count;
+            p[0] = (uint8)(Bits & 0xFF);
+            p[1] = (uint8)((Bits >> 8) & 0xFF);
+            p[2] = (uint8)((Bits >> 16) & 0xFF);
+            p[3] = (uint8)((Bits >> 24) & 0xFF);
+            Count += 4;
+            Bits >>= 32;
+            BitCount -= 32;
+        }
+    }
+}
+
+// A bit reader through a pointer, kept in locals in the hot loop. Refill loads 8 bytes at once while they are there;
+// the bits above BitCount are then already the next bits of the input, which the next refill ORs in again.
+struct _FastReader
+{
+    uint8* P;
+    int Length;
+    int Pos;
+    uint64 Bits;
+    int BitCount;
+    int Overrun;
+
+    unsafe void Refill()
+    {
+        if (Pos + 8 <= Length)
+        {
+            Bits |= _Load64(P + Pos) << BitCount;
+            int bytes = (63 - BitCount) >> 3;
+            Pos += bytes;
+            BitCount += bytes << 3;
+            return;
+        }
+        while (BitCount <= 56)
+        {
+            uint64 b = 0;
+            if (Pos < Length)
+                b = P[Pos];
+            else
+                Overrun += 1;
+            Pos += 1;
+            Bits |= b << BitCount;
+            BitCount += 8;
+        }
+    }
+
+    uint32 Take(int count)
+    {
+        uint32 value = (uint32)(Bits & ((1ul << count) - 1));
+        Bits >>= count;
+        BitCount -= count;
+        return value;
+    }
+
+    // The next symbol of a table (codes of at most 16 bits; the caller makes sure there are enough bits), or -1.
+    unsafe int Decode(int* entries, int tableBits)
+    {
+        int e = entries[(int)(Bits & (uint64)((1 << tableBits) - 1))];
+        if ((e & 32) != 0)
+            e = entries[(e >> 6) + (int)((Bits >> tableBits) & (uint64)((1 << (e & 31)) - 1))];
+        int len = e & 31;
+        if (len == 0)
+            return -1;
+        Bits >>= len;
+        BitCount -= len;
+        return e >> 6;
+    }
+}

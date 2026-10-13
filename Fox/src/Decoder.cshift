@@ -1,0 +1,245 @@
+namespace FoxCompression;
+
+using System;
+
+FoxError<void> _ReadHeader(ref _ByteReader r)
+{
+    if (r.Byte() != 0x46 || r.Byte() != 0x4F || r.Byte() != 0x58)
+        return error(FoxError.InvalidData);
+    int version = r.Byte();
+    if (version < 0)
+        return error(FoxError.Truncated);
+    if (version != _FormatVersion)
+        return error(FoxError.UnsupportedVersion);
+    return;
+}
+
+FoxError<uint8[]> _Decompress(ReadOnlySlice<uint8> data)
+{
+    var r = _ByteReader { Data = data };
+    try _ReadHeader(ref r);
+    int64 size = r.Varint();
+    if (size < 0)
+        return error(FoxError.Truncated);
+    if (size > int.MaxValue)
+        return error(FoxError.InvalidData);
+    var output = new uint8[(int)size];
+    var dict = new uint16[65536];
+    int o = 0;
+    while (o < output.Length)
+    {
+        int type = r.Byte();
+        int64 raw = r.Varint();
+        if (type < 0 || raw < 0)
+            return error(FoxError.Truncated);
+        if (raw == 0 || raw > _BlockSize || raw > output.Length - o)
+            return error(FoxError.InvalidData);
+        int rawSize = (int)raw;
+        if (type == _BlockStored)
+        {
+            if (rawSize > data.Length - r.Pos)
+                return error(FoxError.Truncated);
+            for (var i = 0; i < rawSize; i += 1)
+                output[o + i] = data[r.Pos + i];
+            r.Pos += rawSize;
+        }
+        else if (type == _BlockBytes || type == _BlockWords)
+        {
+            int64 payload = r.Varint();
+            if (payload < 0)
+                return error(FoxError.Truncated);
+            if (payload > data.Length - r.Pos)
+                return error(FoxError.Truncated);
+            int end = r.Pos + (int)payload;
+            try _DecodeBlock(data[r.Pos..end], output, o, rawSize, type == _BlockBytes ? 1 : 2, dict);
+            r.Pos = end;
+        }
+        else
+        {
+            return error(FoxError.InvalidData);
+        }
+        o += rawSize;
+    }
+    if (r.Pos + 4 > data.Length)
+        return error(FoxError.Truncated);
+    uint32 stored = (uint32)data[r.Pos] | ((uint32)data[r.Pos + 1] << 8) | ((uint32)data[r.Pos + 2] << 16)
+        | ((uint32)data[r.Pos + 3] << 24);
+    if (_Crc32(output) != stored)
+        return error(FoxError.ChecksumMismatch);
+    return output;
+}
+
+// Decodes one compressed block into output[o .. o + raw].
+FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int raw, int unit, uint16[] dict)
+{
+    var r = _BitReader { Data = src };
+    int numMain = (int)r.Take(17);
+    int numDist = (int)r.Take(6);
+    int maxMain = unit == 1 ? _LengthCodes + 256 : _MainSymbolsMax;
+    if (numMain > maxMain || numDist > _DistCodes)
+        return error(FoxError.InvalidData);
+
+    // the code lengths
+    var preLen = new uint8[_PreCodes];
+    for (var i = 0; i < _PreCodes; i += 1)
+        preLen[i] = (uint8)r.Take(3);
+    var pre = _BuildTable(preLen, _PreCodes, _PreMaxLength);
+    if (pre.Entries == null)
+        return error(FoxError.InvalidData);
+    int total = numMain + numDist;
+    var lengths = new uint8[total];
+    int n = 0;
+    int previous = 0;
+    while (n < total)
+    {
+        int sym = _Decode(ref r, pre);
+        int repeat = 0;
+        int value = 0;
+        if (sym < 0)
+            return error(FoxError.InvalidData);
+        if (sym <= 16)
+        {
+            lengths[n] = (uint8)sym;
+            n += 1;
+            previous = sym;
+            continue;
+        }
+        if (sym == 17)
+        {
+            repeat = 3 + (int)r.Take(3);
+        }
+        else if (sym == 18)
+        {
+            repeat = 11 + (int)r.Take(7);
+        }
+        else
+        {
+            if (previous == 0)
+                return error(FoxError.InvalidData);
+            repeat = 3 + (int)r.Take(2);
+            value = previous;
+        }
+        if (repeat > total - n)
+            return error(FoxError.InvalidData);
+        for (var i = 0; i < repeat; i += 1)
+            lengths[n + i] = (uint8)value;
+        n += repeat;
+        if (r.PastEnd())
+            return error(FoxError.Truncated);
+    }
+    var mainLen = new uint8[numMain];
+    for (var i = 0; i < numMain; i += 1)
+        mainLen[i] = lengths[i];
+    var distLen = new uint8[numDist];
+    for (var i = 0; i < numDist; i += 1)
+        distLen[i] = lengths[numMain + i];
+    var main = _BuildTable(mainLen, numMain, 11);
+    var dists = _BuildTable(distLen, numDist, 9);
+    if (main.Entries == null || dists.Entries == null)
+        return error(FoxError.InvalidData);
+
+    // the tokens: the hot loop, with the bit reader in locals and pointers into the tables and the output
+    int unitsEnd = o + raw / unit * unit;
+    int minUnits = _MinMatchBytes / unit;
+    int dictSize = 0;
+    unsafe
+    {
+        var f = _FastReader { P = src.Length > 0 ? src.Ptr() : null, Length = src.Length, Pos = r.Pos, Bits = r.Bits,
+            BitCount = r.BitCount, Overrun = r.Overrun };
+        int* me = main.Entries[0..].Ptr();
+        int mb = main.Bits;
+        int* de = dists.Entries[0..].Ptr();
+        int db = dists.Bits;
+        uint8* out = output[0..].Ptr();
+        uint16* dp = dict[0..].Ptr();
+        int outLength = output.Length;
+        while (o < unitsEnd)
+        {
+            if (f.BitCount < 32)
+                f.Refill();
+            int s = f.Decode(me, mb);
+            if (s < 0)
+                return error(FoxError.InvalidData);
+            if (s >= _LengthCodes)
+            {
+                if (unit == 1)
+                {
+                    out[o] = (uint8)(s - _LengthCodes);
+                    o += 1;
+                    continue;
+                }
+                uint32 w = 0;
+                if (s == _LengthCodes)
+                {
+                    w = f.Take(16);
+                    dp[dictSize] = (uint16)w;
+                    dictSize += 1;
+                }
+                else
+                {
+                    int index = s - _LengthCodes - 1;
+                    if (index >= dictSize)
+                        return error(FoxError.InvalidData);
+                    w = dp[index];
+                }
+                out[o] = (uint8)(w & 0xFF);
+                out[o + 1] = (uint8)(w >> 8);
+                o += 2;
+                continue;
+            }
+            int eb = _BucketExtraBits(s);
+            int v = _BucketBase(s) + (eb > 0 ? (int)f.Take(eb) : 0);
+            int len = (v + minUnits) * unit;
+            if (f.BitCount < 32)
+                f.Refill();
+            int dc = f.Decode(de, db);
+            if (dc < 0)
+                return error(FoxError.InvalidData);
+            int ebd = _BucketExtraBits(dc);
+            int dist = (_BucketBase(dc) + (ebd > 0 ? (int)f.Take(ebd) : 0) + 1) * unit;
+            if (dist > o || len > unitsEnd - o)
+                return error(FoxError.InvalidData);
+            uint8* to = out + o;
+            uint8* from = to - dist;
+            if (dist >= 8 && o + len + 8 <= outLength)
+            {
+                // 8 bytes at a time; may write up to 7 bytes too far, which later tokens overwrite
+                int n = 0;
+                while (n < len)
+                {
+                    _Store64(to + n, _Load64(from + n));
+                    n += 8;
+                }
+            }
+            else
+            {
+                for (var i = 0; i < len; i += 1)
+                    to[i] = from[i];
+            }
+            o += len;
+            if (f.Overrun > 64)
+                return error(FoxError.Truncated);
+        }
+        r.Pos = f.Pos;
+        r.Bits = f.Bits;
+        r.BitCount = f.BitCount;
+        r.Overrun = f.Overrun;
+    }
+    if (raw % unit != 0)
+        output[o] = (uint8)r.Take(8);
+    if (r.PastEnd())
+        return error(FoxError.Truncated);
+    return;
+}
+
+unsafe void _Store64(uint8* p, uint64 v)
+{
+    p[0] = (uint8)(v & 0xFF);
+    p[1] = (uint8)((v >> 8) & 0xFF);
+    p[2] = (uint8)((v >> 16) & 0xFF);
+    p[3] = (uint8)((v >> 24) & 0xFF);
+    p[4] = (uint8)((v >> 32) & 0xFF);
+    p[5] = (uint8)((v >> 40) & 0xFF);
+    p[6] = (uint8)((v >> 48) & 0xFF);
+    p[7] = (uint8)(v >> 56);
+}

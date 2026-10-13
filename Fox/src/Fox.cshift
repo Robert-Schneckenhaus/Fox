@@ -1,0 +1,129 @@
+namespace FoxCompression;
+
+using System;
+
+//! **Fox** — a fast general-purpose compressor: LZ77 matches followed by a Huffman stage whose literals are either
+//! bytes or 16-bit words. Word literals use the FOX scheme (*First Occurrence indeX*): the first occurrence of a word in
+//! a block is stored raw and gets the next index, every later one is coded as that index. Each block picks the literal
+//! kind that suits its data (text: bytes; 16-bit samples, tile maps, 16-bit pixels: often words).
+//!
+//! ```
+//! using FoxCompression;
+//!
+//! uint8[] packed = Fox.Compress(bytes);          // level 5
+//! uint8[] smallest = Fox.Compress(bytes, 9);
+//! uint8[] unpacked = try Fox.Decompress(packed);
+//! ```
+//!
+//! The format is described in FORMAT.md.
+
+/// The errors of [Fox.Decompress].
+error FoxError
+{
+    /// The data is not a Fox stream, or a block or code in it is invalid.
+    InvalidData = 1,
+    /// The data ends before the end of the stream.
+    Truncated = 2,
+    /// The data was decompressed, but its CRC-32 does not match the one that was stored.
+    ChecksumMismatch = 3,
+    /// The stream has a format version this library does not know.
+    UnsupportedVersion = 4
+}
+
+/// Which literals the blocks use.
+enum FoxMode : int
+{
+    /// Each block tries both on a sample of its data and takes the smaller result.
+    Auto = 0,
+    /// Byte literals (best for text and most mixed data).
+    Bytes = 1,
+    /// 16-bit word literals with the FOX index scheme.
+    Words = 2
+}
+
+/// The compression level of [Fox.Compress] without a level.
+const int FoxDefaultLevel = 5;
+
+/// Compresses and decompresses data in the Fox format.
+struct Fox
+{
+    /// `data` compressed with the default level 5.
+    static uint8[] Compress(ReadOnlySlice<uint8> data)
+    {
+        return Compress(data, FoxDefaultLevel, FoxMode.Auto);
+    }
+
+    /// `data` compressed with `level`: 0 uses no matches at all (pure FOX/Huffman, fastest), 1 is the fastest level
+    /// with matches, 9 the smallest output.
+    /// @panics when `level` is not 0 to 9.
+    static uint8[] Compress(ReadOnlySlice<uint8> data, int level)
+    {
+        return Compress(data, level, FoxMode.Auto);
+    }
+
+    /// `data` compressed with `level` and the literal kind `mode`.
+    /// @panics when `level` is not 0 to 9.
+    static uint8[] Compress(ReadOnlySlice<uint8> data, int level, FoxMode mode)
+    {
+        if (level < 0 || level > 9)
+            Environment.Panic("Fox.Compress: level must be 0 to 9, not " + level.ToString());
+        var output = _BitWriter.Create(data.Length / 2 + 64);
+        output.PutByte(0x46);   // F
+        output.PutByte(0x4F);   // O
+        output.PutByte(0x58);   // X
+        output.PutByte(_FormatVersion);
+        output.PutVarint(data.Length);
+        var encoder = _Encoder.Create(level, mode);
+        for (var start = 0; start < data.Length; start += _BlockSize)
+            encoder.CompressBlock(data, start, Math.Min(start + _BlockSize, data.Length), ref output);
+        uint32 crc = _Crc32(data);
+        output.Align();
+        for (var i = 0; i < 4; i += 1)
+            output.PutByte((int)((crc >> (8 * i)) & 0xFF));
+        return output.ToArray();
+    }
+
+    /// The original bytes of the Fox stream `data`. Bytes after the end of the stream are ignored.
+    /// @error FoxError.InvalidData `data` is not a valid Fox stream.
+    /// @error FoxError.Truncated `data` ends before the end of the stream.
+    /// @error FoxError.ChecksumMismatch the decompressed data does not match the stored CRC-32.
+    /// @error FoxError.UnsupportedVersion the stream was written by a newer format version.
+    static FoxError<uint8[]> Decompress(ReadOnlySlice<uint8> data)
+    {
+        return _Decompress(data);
+    }
+
+    /// The size of the original data of the Fox stream `data`, read from its header.
+    /// @error FoxError.InvalidData `data` does not start with a Fox header.
+    static FoxError<int64> OriginalSize(ReadOnlySlice<uint8> data)
+    {
+        var r = _ByteReader { Data = data };
+        try _ReadHeader(ref r);
+        int64 size = r.Varint();
+        if (size < 0)
+            return error(FoxError.InvalidData);
+        return size;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Format constants (see FORMAT.md)
+
+const int _FormatVersion = 1;
+
+const int _BlockStored = 0;
+const int _BlockBytes = 1;
+const int _BlockWords = 2;
+
+const int _BlockSize = 1 << 17;        // bytes per block
+const int _Window = 1 << 18;           // the largest match distance in bytes
+const int _MinMatchBytes = 4;
+const int _MaxMatchUnits = 32768;
+const int _SampleSize = 16384;         // the part of a block that decides between byte and word literals
+
+const int _LengthCodes = 32;           // match length - minimum < 2^16
+const int _DistCodes = 36;             // distance - 1 < 2^18
+const int _MainSymbolsMax = _LengthCodes + 1 + 65536;
+const int _MaxCodeLength = 16;
+const int _PreCodes = 20;
+const int _PreMaxLength = 7;

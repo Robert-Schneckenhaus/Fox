@@ -1,0 +1,267 @@
+using System;
+using System.Compression;
+using FoxCompression;
+
+// Roundtrip tests over generated data (all levels and literal modes), and a fuzzer that feeds damaged streams to the
+// decoder: it must return an error, never panic or return wrong data without one.
+// Optional arguments: files to roundtrip as well.
+
+int Failures;
+
+struct Rng
+{
+    uint64 State;
+
+    uint32 Next()
+    {
+        unchecked
+        {
+            State ^= State << 13;
+            State ^= State >> 7;
+            State ^= State << 17;
+        }
+        return (uint32)(State >> 32);
+    }
+
+    int Below(int n)
+    {
+        return (int)(Next() % (uint32)n);
+    }
+}
+
+void Check(bool ok, string what)
+{
+    if (!ok)
+    {
+        Console.WriteLine("FAIL: " + what);
+        Failures += 1;
+    }
+}
+
+bool Same(ReadOnlySlice<uint8> a, ReadOnlySlice<uint8> b)
+{
+    if (a.Length != b.Length)
+        return false;
+    for (var i = 0; i < a.Length; i += 1)
+    {
+        if (a[i] != b[i])
+            return false;
+    }
+    return true;
+}
+
+void Roundtrip(string name, ReadOnlySlice<uint8> data, bool allLevels)
+{
+    var modes = new FoxMode[] { FoxMode.Auto, FoxMode.Bytes, FoxMode.Words };
+    int smallest = int.MaxValue;
+    for (var level = 0; level <= 9; level += 1)
+    {
+        if (!allLevels && level != 0 && level != 1 && level != 5 && level != 9)
+            continue;
+        foreach (var mode in modes)
+        {
+            var packed = Fox.Compress(data, level, mode);
+            smallest = Math.Min(smallest, packed.Length);
+            var result = Fox.Decompress(packed);
+            if (result is uint8[] back)
+                Check(Same(back, data), $"{name}: level {level} mode {(int)mode} gives different data");
+            else
+                Check(false, $"{name}: level {level} mode {(int)mode}: {result.Message}");
+        }
+    }
+    Console.WriteLine($"ok  {name,-28} {data.Length,9} -> {smallest,9}");
+}
+
+uint8[] Text(int size)
+{
+    var words = new string[] { "the ", "quick ", "brown ", "fox ", "jumps ", "over ", "lazy ", "dog", ". ", "\n",
+        "compression ", "index ", "first ", "occurrence ", "of ", "a ", "word ", "Huffman ", "table, ", "and " };
+    var rng = Rng { State = 12345 };
+    var result = new uint8[size];
+    int n = 0;
+    while (n < size)
+    {
+        var w = words[rng.Below(words.Length)];
+        for (var i = 0; i < w.Length && n < size; i += 1)
+        {
+            result[n] = (uint8)w[i];
+            n += 1;
+        }
+    }
+    return result;
+}
+
+uint8[] Bitmap(int width, int height, int colors, int bytesPerPixel, bool dither)
+{
+    var rng = Rng { State = 777 };
+    var pixels = new int[width * height];
+    for (var r = 0; r < 60; r += 1)
+    {
+        int x0 = rng.Below(width);
+        int y0 = rng.Below(height);
+        int w = 5 + rng.Below(width / 3);
+        int h = 5 + rng.Below(height / 3);
+        int c = rng.Below(colors);
+        for (var y = y0; y < Math.Min(height, y0 + h); y += 1)
+        {
+            for (var x = x0; x < Math.Min(width, x0 + w); x += 1)
+                pixels[y * width + x] = c;
+        }
+    }
+    var result = new uint8[width * height * bytesPerPixel];
+    for (var i = 0; i < pixels.Length; i += 1)
+    {
+        int c = pixels[i];
+        if (dither && rng.Below(10) < 3)
+            c = (c + 1 + rng.Below(2)) % colors;
+        // a palette: colors spread over the value range
+        uint32 value = 0;
+        unchecked
+        {
+            value = (uint32)c * 2654435761u;
+        }
+        for (var b = 0; b < bytesPerPixel; b += 1)
+            result[i * bytesPerPixel + b] = (uint8)((value >> (8 * b)) & 0xFF);
+    }
+    return result;
+}
+
+bool Fails(FoxError<uint8[]> result, FoxError expected)
+{
+    return result is FoxError code && code == expected;
+}
+
+void Fuzz(ReadOnlySlice<uint8> data, int rounds)
+{
+    var rng = Rng { State = 99 };
+    var packed = Fox.Compress(data, 6);
+    int errors = 0;
+    for (var round = 0; round < rounds; round += 1)
+    {
+        var damaged = packed.Clone();
+        int kind = rng.Below(3);
+        if (kind == 0)
+        {
+            // flip a few bits
+            int flips = 1 + rng.Below(4);
+            for (var f = 0; f < flips; f += 1)
+            {
+                int at = rng.Below(damaged.Length);
+                damaged[at] = (uint8)(damaged[at] ^ (1 << rng.Below(8)));
+            }
+        }
+        else if (kind == 1)
+        {
+            // cut it off
+            damaged = packed[0..rng.Below(packed.Length)].ToArray();
+        }
+        else
+        {
+            // random bytes after a valid header
+            for (var i = 5; i < damaged.Length; i += 1)
+                damaged[i] = (uint8)rng.Next();
+        }
+        var result = Fox.Decompress(damaged);
+        if (result is uint8[] back)
+            Check(Same(back, data), "fuzz: damaged data decoded without an error but differently");
+        else
+            errors += 1;
+    }
+    Console.WriteLine($"ok  fuzz: {rounds} damaged streams, {errors} rejected, none crashed");
+}
+
+int Main(string[] args)
+{
+    Roundtrip("empty", new uint8[0], true);
+    Roundtrip("1 byte", new uint8[] { 42 }, true);
+    Roundtrip("2 bytes", new uint8[] { 1, 2 }, true);
+    Roundtrip("3 bytes (odd)", new uint8[] { 1, 2, 3 }, true);
+    Roundtrip("5 equal bytes", new uint8[] { 7, 7, 7, 7, 7 }, true);
+
+    // PYC crashed here: no word repeats at all
+    var distinct = new uint8[131072];
+    for (var i = 0; i < 65536; i += 1)
+    {
+        distinct[2 * i] = (uint8)(i & 0xFF);
+        distinct[2 * i + 1] = (uint8)(i >> 8);
+    }
+    Roundtrip("all 65536 words once", distinct, true);
+
+    // PYC gave the only repeated word a code of length 0
+    var oneWord = new uint8[4096];
+    for (var i = 0; i < oneWord.Length; i += 2)
+    {
+        oneWord[i] = 0x34;
+        oneWord[i + 1] = 0x12;
+    }
+    Roundtrip("one word repeated", oneWord, true);
+
+    var rng = Rng { State = 4242 };
+    var random = new uint8[300001];
+    for (var i = 0; i < random.Length; i += 1)
+        random[i] = (uint8)rng.Next();
+    Roundtrip("random (odd size)", random, false);
+
+    Roundtrip("zeros 1 MB", new uint8[1 << 20], false);
+    Roundtrip("text 700 KB", Text(700001), false);
+    Roundtrip("8bpp 16 colors", Bitmap(320, 256, 16, 1, false), true);
+    Roundtrip("8bpp 16 colors dithered", Bitmap(320, 256, 16, 1, true), false);
+    Roundtrip("16bpp 64 colors dithered", Bitmap(320, 256, 64, 2, true), false);
+    Roundtrip("24bpp 16 colors", Bitmap(640, 480, 16, 3, false), false);
+
+    var tiles = new uint8[8192];
+    for (var i = 0; i < tiles.Length; i += 2)
+    {
+        int t = rng.Below(40) * 37;
+        tiles[i] = (uint8)(t & 0xFF);
+        tiles[i + 1] = (uint8)(t >> 8);
+    }
+    Roundtrip("16-bit tile map", tiles, true);
+
+    // a text with a stretch of random bytes and a long run: blocks of different kinds in one stream
+    var mixed = new uint8[600000];
+    var text = Text(200000);
+    for (var i = 0; i < mixed.Length; i += 1)
+        mixed[i] = i < 200000 ? text[i] : (i < 400000 ? (uint8)rng.Next() : (uint8)((i / 1000) & 0xFF));
+    Roundtrip("mixed blocks", mixed, false);
+
+    foreach (var path in args)
+    {
+        if (File.ReadAllBytes(path) is uint8[] bytes)
+            Roundtrip(path, bytes, false);
+        else
+            Check(false, "cannot read " + path);
+    }
+
+    Fuzz(Text(50000), 3000);
+    Fuzz(Bitmap(200, 100, 64, 2, true), 3000);
+
+    // errors that must be named correctly
+    var packed = Fox.Compress(Text(1000));
+    Check(Fails(Fox.Decompress(packed[0..10].ToArray()), FoxError.Truncated), "a cut-off stream is Truncated");
+    var badCrc = packed.Clone();
+    badCrc[badCrc.Length - 1] = (uint8)(badCrc[badCrc.Length - 1] ^ 1);
+    Check(Fails(Fox.Decompress(badCrc), FoxError.ChecksumMismatch), "a wrong CRC is ChecksumMismatch");
+    var newer = packed.Clone();
+    newer[3] = 2;
+    Check(Fails(Fox.Decompress(newer), FoxError.UnsupportedVersion), "version 2 is UnsupportedVersion");
+    Check(Fails(Fox.Decompress(new uint8[] { 1, 2, 3, 4, 5 }), FoxError.InvalidData), "garbage is InvalidData");
+    Check(Fox.OriginalSize(packed) is int64 size && size == 1000, "OriginalSize reads the header");
+
+    // the stream ends with the CRC-32 of zip/PNG (checked against the standard library)
+    for (var n = 0; n < 40; n += 1)
+    {
+        var bytes = Text(n * 37);
+        var stream = Fox.Compress(bytes);
+        uint32 stored = (uint32)stream[^4] | ((uint32)stream[^3] << 8) | ((uint32)stream[^2] << 16) | ((uint32)stream[^1] << 24);
+        Check(stored == Crc32.Compute(bytes), $"CRC-32 of {bytes.Length} bytes");
+    }
+
+    if (Failures > 0)
+    {
+        Console.WriteLine($"{Failures} test(s) failed");
+        return 1;
+    }
+    Console.WriteLine("all tests passed");
+    return 0;
+}

@@ -1,0 +1,364 @@
+namespace FoxCompression;
+
+using System;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Building codes
+
+// Code lengths (1 to maxLength) for the symbols with a frequency above 0, 0 for the others. A single used symbol
+// gets length 1. The lengths are optimal Huffman lengths when they fit maxLength; otherwise the longest codes are
+// shortened and the Kraft sum is repaired by lengthening the least frequent of the shorter ones.
+// count must not exceed 2^maxLength used symbols (always true for the alphabets of Fox).
+uint8[] _CodeLengths(int[] freq, int count, int maxLength)
+{
+    var lengths = new uint8[count];
+    int n = 0;
+    for (var i = 0; i < count; i += 1)
+    {
+        if (freq[i] > 0)
+            n += 1;
+    }
+    if (n == 0)
+        return lengths;
+    if (n == 1)
+    {
+        for (var i = 0; i < count; i += 1)
+        {
+            if (freq[i] > 0)
+                lengths[i] = 1;
+        }
+        return lengths;
+    }
+
+    // the used symbols, sorted by frequency (ascending), the symbol in the low 20 bits
+    var keys = new int64[n];
+    int k = 0;
+    for (var i = 0; i < count; i += 1)
+    {
+        if (freq[i] > 0)
+        {
+            keys[k] = ((int64)freq[i] << 20) | (int64)i;
+            k += 1;
+        }
+    }
+    _HeapSort(keys, n);
+
+    // Moffat and Katajainen: Huffman code lengths of sorted frequencies, in place, in linear time
+    var a = new int[n];
+    for (var i = 0; i < n; i += 1)
+        a[i] = (int)(keys[i] >> 20);
+    a[0] += a[1];
+    int root = 0;
+    int leaf = 2;
+    for (var next = 1; next < n - 1; next += 1)
+    {
+        if (leaf >= n || a[root] < a[leaf])
+        {
+            a[next] = a[root];
+            a[root] = next;
+            root += 1;
+        }
+        else
+        {
+            a[next] = a[leaf];
+            leaf += 1;
+        }
+        if (leaf >= n || (root < next && a[root] < a[leaf]))
+        {
+            a[next] += a[root];
+            a[root] = next;
+            root += 1;
+        }
+        else
+        {
+            a[next] += a[leaf];
+            leaf += 1;
+        }
+    }
+    a[n - 2] = 0;
+    for (var next = n - 3; next >= 0; next -= 1)
+        a[next] = a[a[next]] + 1;
+    int avail = 1;
+    int used = 0;
+    int depth = 0;
+    root = n - 2;
+    int at = n - 1;
+    while (avail > 0)
+    {
+        while (root >= 0 && a[root] == depth)
+        {
+            used += 1;
+            root -= 1;
+        }
+        while (avail > used)
+        {
+            a[at] = depth;
+            at -= 1;
+            avail -= 1;
+        }
+        avail = 2 * used;
+        depth += 1;
+        used = 0;
+    }
+
+    // count the lengths, longer ones as maxLength, then repair the Kraft sum
+    var blCount = new int[maxLength + 1];
+    for (var i = 0; i < n; i += 1)
+        blCount[Math.Min(a[i], maxLength)] += 1;
+    int64 total = 0;
+    for (var len = 1; len <= maxLength; len += 1)
+        total += (int64)blCount[len] << (maxLength - len);
+    int64 limit = 1L << maxLength;
+    while (total > limit)
+    {
+        int j = maxLength - 1;
+        while (blCount[j] == 0)
+            j -= 1;
+        blCount[j] -= 1;
+        blCount[j + 1] += 1;
+        total -= 1L << (maxLength - j - 1);
+    }
+
+    // the shortest lengths to the most frequent symbols
+    int idx = n - 1;
+    for (var len = 1; len <= maxLength; len += 1)
+    {
+        for (var c = blCount[len]; c > 0; c -= 1)
+        {
+            lengths[(int)(keys[idx] & 0xFFFFF)] = (uint8)len;
+            idx -= 1;
+        }
+    }
+    return lengths;
+}
+
+// The canonical codes for the lengths, bit-reversed for the writer (lowest bit first).
+uint32[] _Codes(uint8[] lengths, int count)
+{
+    var blCount = new int[32];
+    for (var i = 0; i < count; i += 1)
+        blCount[lengths[i]] += 1;
+    blCount[0] = 0;
+    var next = new uint32[32];
+    uint32 code = 0;
+    for (var len = 1; len < 32; len += 1)
+    {
+        code = (code + (uint32)blCount[len - 1]) << 1;
+        next[len] = code;
+    }
+    var codes = new uint32[count];
+    for (var sym = 0; sym < count; sym += 1)
+    {
+        int len = lengths[sym];
+        if (len == 0)
+            continue;
+        uint32 c = next[len];
+        next[len] = c + 1;
+        uint32 reversed = 0;
+        for (var b = 0; b < len; b += 1)
+        {
+            reversed = (reversed << 1) | (c & 1);
+            c >>= 1;
+        }
+        codes[sym] = reversed;
+    }
+    return codes;
+}
+
+// The bits a code with these lengths would need for the frequencies.
+int64 _CodeCost(int[] freq, uint8[] lengths, int count)
+{
+    int64 bits = 0;
+    for (var i = 0; i < count; i += 1)
+        bits += (int64)freq[i] * lengths[i];
+    return bits;
+}
+
+void _HeapSort(int64[] a, int n)
+{
+    for (var start = n / 2 - 1; start >= 0; start -= 1)
+        _SiftDown(a, start, n);
+    for (var end = n - 1; end > 0; end -= 1)
+    {
+        var t = a[0];
+        a[0] = a[end];
+        a[end] = t;
+        _SiftDown(a, 0, end);
+    }
+}
+
+void _SiftDown(int64[] a, int start, int n)
+{
+    int root = start;
+    while (true)
+    {
+        int child = 2 * root + 1;
+        if (child >= n)
+            return;
+        if (child + 1 < n && a[child + 1] > a[child])
+            child += 1;
+        if (a[root] >= a[child])
+            return;
+        var t = a[root];
+        a[root] = a[child];
+        a[child] = t;
+        root = child;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Decoding tables
+
+// A two-level decoding table, indexed by the next bits of the input (lowest first).
+// Entry: 0 = invalid code; otherwise symbol << 6 | length (1..31), or for a code longer than Bits a link to a
+// second-level table: offset << 6 | 32 | its index bits.
+struct _Table
+{
+    int[] Entries;
+    int Bits;
+}
+
+// The table for the code lengths, or one with Entries null if the lengths are over-subscribed (not a prefix code).
+// Incomplete codes are accepted; their unused bit patterns decode as invalid.
+_Table _BuildTable(uint8[] lengths, int count, int primaryBits)
+{
+    var blCount = new int[32];
+    int maxLen = 0;
+    for (var i = 0; i < count; i += 1)
+    {
+        blCount[lengths[i]] += 1;
+        maxLen = Math.Max(maxLen, (int)lengths[i]);
+    }
+    if (maxLen == 0)
+        return _Table { Entries = new int[1], Bits = 0 };
+    blCount[0] = 0;
+    int64 left = 1;
+    for (var len = 1; len <= maxLen; len += 1)
+    {
+        left = left * 2 - blCount[len];
+        if (left < 0)
+            return _Table { };
+    }
+
+    int p = Math.Min(primaryBits, maxLen);
+    int mask = (1 << p) - 1;
+    var codes = _Codes(lengths, count);
+    var subBits = new int[1 << p];
+    for (var sym = 0; sym < count; sym += 1)
+    {
+        int len = lengths[sym];
+        if (len > p)
+        {
+            int prefix = (int)codes[sym] & mask;
+            subBits[prefix] = Math.Max(subBits[prefix], len - p);
+        }
+    }
+    int size = 1 << p;
+    var offset = new int[1 << p];
+    for (var prefix = 0; prefix <= mask; prefix += 1)
+    {
+        if (subBits[prefix] > 0)
+        {
+            offset[prefix] = size;
+            size += 1 << subBits[prefix];
+        }
+    }
+    var entries = new int[size];
+    for (var prefix = 0; prefix <= mask; prefix += 1)
+    {
+        if (subBits[prefix] > 0)
+            entries[prefix] = (offset[prefix] << 6) | 32 | subBits[prefix];
+    }
+    for (var sym = 0; sym < count; sym += 1)
+    {
+        int len = lengths[sym];
+        if (len == 0)
+            continue;
+        int code = (int)codes[sym];
+        int entry = (sym << 6) | len;
+        if (len <= p)
+        {
+            for (var i = code; i <= mask; i += 1 << len)
+                entries[i] = entry;
+        }
+        else
+        {
+            int prefix = code & mask;
+            int start = offset[prefix];
+            int end = 1 << subBits[prefix];
+            for (var i = code >> p; i < end; i += 1 << (len - p))
+                entries[start + i] = entry;
+        }
+    }
+    return _Table { Entries = entries, Bits = p };
+}
+
+// The next symbol, or -1 for an invalid code. Codes are at most 16 bits long.
+int _Decode(ref _BitReader r, const ref _Table t)
+{
+    if (r.BitCount < 32)
+        r.Fill();
+    int e = t.Entries[(int)(r.Bits & (uint64)((1 << t.Bits) - 1))];
+    if ((e & 32) != 0)
+        e = t.Entries[(e >> 6) + (int)((r.Bits >> t.Bits) & (uint64)((1 << (e & 31)) - 1))];
+    int len = e & 31;
+    if (len == 0)
+        return -1;
+    r.Bits >>= len;
+    r.BitCount -= len;
+    return e >> 6;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Values in log buckets (match lengths and distances)
+//
+// 0..3 are codes 0..3 without extra bits; above, the code is 2 * floor(log2(v)) plus the bit below the highest one,
+// and the remaining floor(log2(v)) - 1 bits follow as extra bits: 4,5 -> 4; 6,7 -> 5; 8..11 -> 6; 12..15 -> 7; ...
+
+int _BucketCode(int v)
+{
+    if (v < 4)
+        return v;
+    int n = _Log2Floor(v);
+    return 2 * n + ((v >> (n - 1)) & 1);
+}
+
+int _BucketExtraBits(int code)
+{
+    return code < 4 ? 0 : code / 2 - 1;
+}
+
+int _BucketBase(int code)
+{
+    if (code < 4)
+        return code;
+    return (2 | (code & 1)) << (code / 2 - 1);
+}
+
+int _Log2Floor(int v)
+{
+    int n = 0;
+    if (v >= 1 << 16)
+    {
+        v >>= 16;
+        n += 16;
+    }
+    if (v >= 1 << 8)
+    {
+        v >>= 8;
+        n += 8;
+    }
+    if (v >= 1 << 4)
+    {
+        v >>= 4;
+        n += 4;
+    }
+    if (v >= 1 << 2)
+    {
+        v >>= 2;
+        n += 2;
+    }
+    if (v >= 2)
+        n += 1;
+    return n;
+}

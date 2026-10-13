@@ -1,0 +1,8 @@
+{
+	"name": "fox",
+	"type": "executable",
+	"sources": ["src"],
+	"output": "bin/fox",
+	"optimize": 2,
+	"dependencies": ["../Fox"]
+}

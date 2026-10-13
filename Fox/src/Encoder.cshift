@@ -1,0 +1,587 @@
+namespace FoxCompression;
+
+using System;
+
+// The settings of the compression levels 0 to 9: how many earlier positions the match finder tries, from which
+// match length (bytes) it stops searching, whether it looks one position ahead for a longer match (lazy matching)
+// and up to which match length (bytes) it enters the positions inside a match into the hash chains.
+const ReadOnlySlice<int> _LevelChain = [0, 1, 4, 8, 16, 32, 64, 128, 256, 1024];
+const ReadOnlySlice<int> _LevelNice = [0, 16, 32, 64, 64, 128, 128, 256, 512, 2048];
+
+const ReadOnlySlice<int> _LevelInsertLimit = [0, 0, 0, 16, 32, 32, 64, 128, 256, 65536];
+
+// the largest distance (bytes) at which a match of the minimum length (4 bytes) is used
+const int _FarMinMatchBytes = 1 << 18;
+const int _FarMinMatchWords = 128;
+
+const int _HashBits = 16;
+const int _SampleHashBits = 13;
+const int _SampleWindow = 1 << 15;
+
+// The tokens of one block, the frequencies of their symbols, and the match finders that produce them.
+struct _Encoder
+{
+    int Chain;
+    int Nice;
+    bool Lazy;
+    int InsertLimit;
+    FoxMode Mode;
+
+    // the match finder over the whole input
+    int[] Head;
+    int[] Prev;
+    int NextInsert;
+
+    // a small match finder for trying both literal kinds on a sample of a block
+    int[] SampleHead;
+    int[] SamplePrev;
+
+    // the tokens: Sym is the main symbol; Value the length value of a match or the word of a new literal word;
+    // Dist the distance - 1 of a match (in units)
+    int[] Sym;
+    int[] Value;
+    int[] Dist;
+    int Count;
+    int[] MainFreq;
+    int[] DistFreq;
+    int MainUsed;
+    int64 ExtraBits;
+    int NewWords;
+
+    // word literals: the index of each word in this block's dictionary, valid when its stamp is the block's
+    int[] WordIndex;
+    int[] WordStamp;
+    int Stamp;
+    int DictSize;
+
+    _BitWriter Block;
+
+    // the same arrays as pointers, for the hot loops (the arrays above keep them alive)
+    int* SymP;
+    int* ValueP;
+    int* DistP;
+    int* MainFreqP;
+    int* DistFreqP;
+    int* WordIndexP;
+    int* WordStampP;
+
+    static _Encoder Create(int level, FoxMode mode)
+    {
+        var e = _Encoder {
+            Chain = _LevelChain[level],
+            Nice = _LevelNice[level],
+            Lazy = level >= 4,
+            InsertLimit = _LevelInsertLimit[level],
+            Mode = mode,
+            Head = new int[1 << _HashBits],
+            Prev = new int[_Window],
+            SampleHead = new int[1 << _SampleHashBits],
+            SamplePrev = new int[_SampleWindow],
+            Sym = new int[_BlockSize],
+            Value = new int[_BlockSize],
+            Dist = new int[_BlockSize],
+            MainFreq = new int[_MainSymbolsMax],
+            DistFreq = new int[_DistCodes],
+            WordIndex = new int[65536],
+            WordStamp = new int[65536],
+            Block = _BitWriter.Create(_BlockSize + 1024)
+        };
+        for (var i = 0; i < e.Head.Length; i += 1)
+            e.Head[i] = -1;
+        unsafe
+        {
+            e.SymP = e.Sym[0..].Ptr();
+            e.ValueP = e.Value[0..].Ptr();
+            e.DistP = e.Dist[0..].Ptr();
+            e.MainFreqP = e.MainFreq[0..].Ptr();
+            e.DistFreqP = e.DistFreq[0..].Ptr();
+            e.WordIndexP = e.WordIndex[0..].Ptr();
+            e.WordStampP = e.WordStamp[0..].Ptr();
+        }
+        return e;
+    }
+
+    // Compresses data[start..end] into one block of `output`.
+    void CompressBlock(ReadOnlySlice<uint8> data, int start, int end, ref _BitWriter output)
+    {
+        int raw = end - start;
+        int unit = _ChooseUnit(data, start, end);
+        _Parse(data, start, end, unit, Chain, Head, Prev, _Window, _HashBits, ref NextInsert);
+        _WriteBlock(data, start, end, unit);
+
+        output.Align();
+        if (Block.Count >= raw)
+        {
+            output.PutByte(_BlockStored);
+            output.PutVarint(raw);
+            output.PutBytes(data, start, raw);
+            return;
+        }
+        output.PutByte(unit == 1 ? _BlockBytes : _BlockWords);
+        output.PutVarint(raw);
+        output.PutVarint(Block.Count);
+        output.PutBytes(Block.Data, 0, Block.Count);
+    }
+
+    // 1 for byte literals, 2 for word literals: forced by the mode, or the one whose tokens on a sample of the block
+    // need fewer bits.
+    int _ChooseUnit(ReadOnlySlice<uint8> data, int start, int end)
+    {
+        if (Mode == FoxMode.Bytes)
+            return 1;
+        if (Mode == FoxMode.Words)
+            return 2;
+        if (end - start < 64)
+            return 1;
+        int sampleEnd = Math.Min(end, start + _SampleSize);
+        int chain = Math.Min(Chain, 4);
+
+        _ResetSample();
+        int next = start;
+        _Parse(data, start, sampleEnd, 1, chain, SampleHead, SamplePrev, _SampleWindow, _SampleHashBits, ref next);
+        double byteBits = _EstimateBits();
+
+        _ResetSample();
+        next = start;
+        _Parse(data, start, sampleEnd, 2, chain, SampleHead, SamplePrev, _SampleWindow, _SampleHashBits, ref next);
+        double wordBits = _EstimateBits();
+
+        return wordBits < byteBits ? 2 : 1;
+    }
+
+    void _ResetSample()
+    {
+        for (var i = 0; i < SampleHead.Length; i += 1)
+            SampleHead[i] = -1;
+    }
+
+    // The approximate size of the parsed tokens: the entropy of the symbols, the extra bits, the raw new words and
+    // some bits per used symbol for the code tables.
+    double _EstimateBits()
+    {
+        double bits = (double)ExtraBits + 16.0 * NewWords;
+        bits += _Entropy(MainFreq, MainUsed) + _Entropy(DistFreq, _DistCodes);
+        return bits;
+    }
+
+    double _Entropy(int[] freq, int count)
+    {
+        int64 total = 0;
+        int used = 0;
+        for (var i = 0; i < count; i += 1)
+        {
+            total += freq[i];
+            if (freq[i] > 0)
+                used += 1;
+        }
+        if (total == 0)
+            return 0.0;
+        double t = (double)total;
+        double bits = 5.0 * used;
+        for (var i = 0; i < count; i += 1)
+        {
+            if (freq[i] > 0)
+                bits += freq[i] * Math.Log2(t / freq[i]);
+        }
+        return bits;
+    }
+
+    // Splits data[start..end] into literals and matches (LZ77 with hash chains), in units of `unit` bytes.
+    // `nextInsert` is the first position not yet entered into the hash chains of `head`/`prev`.
+    unsafe void _Parse(ReadOnlySlice<uint8> data, int start, int end, int unit, int chain, int[] head, int[] prev,
+        int window, int hashBits, ref int nextInsert)
+    {
+        for (var i = 0; i < MainUsed; i += 1)
+            MainFreq[i] = 0;
+        for (var i = 0; i < _DistCodes; i += 1)
+            DistFreq[i] = 0;
+        Count = 0;
+        ExtraBits = 0;
+        NewWords = 0;
+        DictSize = 0;
+        Stamp += 1;
+        if (end <= start)
+        {
+            MainUsed = _LengthCodes + (unit == 1 ? 256 : 1);
+            return;
+        }
+
+        var m = _Matcher {
+            P = data.Ptr(),
+            Length = data.Length,
+            Head = head[0..].Ptr(),
+            Prev = prev[0..].Ptr(),
+            PrevMask = prev.Length - 1,
+            Window = window,
+            HashShift = 32 - hashBits,
+            Unit = unit,
+            Chain = chain,
+            Nice = Nice,
+            NextInsert = nextInsert,
+            FarMinMatch = unit == 1 ? _FarMinMatchBytes : _FarMinMatchWords
+        };
+        int limit = start + (end - start) / unit * unit;
+        int minUnits = _MinMatchBytes / unit;
+        int pos = start;
+        while (pos < limit)
+        {
+            int len = 0;
+            int dist = 0;
+            if (chain > 0 && pos + _MinMatchBytes <= limit)
+            {
+                len = m.FindAt(pos, limit, ref dist);
+                if (len > 0 && Lazy)
+                {
+                    while (len * unit < Nice && pos + unit + _MinMatchBytes <= limit)
+                    {
+                        int dist2 = 0;
+                        int len2 = m.FindAt(pos + unit, limit, ref dist2);
+                        if (len2 <= len)
+                            break;
+                        _Literal(data, pos, unit);
+                        pos += unit;
+                        len = len2;
+                        dist = dist2;
+                    }
+                }
+            }
+            if (len > 0)
+            {
+                _Match(len, dist, minUnits);
+                pos += len * unit;
+                // positions inside long matches are left out: they would push the older, often better candidates
+                // (the row above in an image) out of the chain, and cost time
+                if (len * unit > InsertLimit && m.NextInsert < pos)
+                    m.NextInsert = pos;
+            }
+            else
+            {
+                _Literal(data, pos, unit);
+                pos += unit;
+            }
+        }
+        nextInsert = m.NextInsert;
+        MainUsed = _LengthCodes + (unit == 1 ? 256 : 1 + DictSize);
+    }
+
+    unsafe void _Literal(ReadOnlySlice<uint8> data, int pos, int unit)
+    {
+        int sym = 0;
+        int value = 0;
+        uint8* p = data.Ptr() + pos;
+        if (unit == 1)
+        {
+            value = p[0];
+            sym = _LengthCodes + value;
+        }
+        else
+        {
+            value = (int)p[0] | ((int)p[1] << 8);
+            if (WordStampP[value] == Stamp)
+            {
+                sym = _LengthCodes + 1 + WordIndexP[value];
+            }
+            else
+            {
+                // FOX: the first occurrence goes raw and gets the next index
+                WordStampP[value] = Stamp;
+                WordIndexP[value] = DictSize;
+                DictSize += 1;
+                sym = _LengthCodes;
+                NewWords += 1;
+            }
+        }
+        SymP[Count] = sym;
+        ValueP[Count] = value;
+        Count += 1;
+        MainFreqP[sym] += 1;
+    }
+
+    unsafe void _Match(int length, int dist, int minUnits)
+    {
+        int v = length - minUnits;
+        int code = _BucketCode(v);
+        int distCode = _BucketCode(dist - 1);
+        SymP[Count] = code;
+        ValueP[Count] = v;
+        DistP[Count] = dist - 1;
+        Count += 1;
+        MainFreqP[code] += 1;
+        DistFreqP[distCode] += 1;
+        ExtraBits += _BucketExtraBits(code) + _BucketExtraBits(distCode);
+    }
+
+    // Writes the tokens with their code tables into Block.
+    void _WriteBlock(ReadOnlySlice<uint8> data, int start, int end, int unit)
+    {
+        Block.Reset();
+        int numMain = MainUsed;
+        while (numMain > 0 && MainFreq[numMain - 1] == 0)
+            numMain -= 1;
+        int numDist = _DistCodes;
+        while (numDist > 0 && DistFreq[numDist - 1] == 0)
+            numDist -= 1;
+        var mainLen = _CodeLengths(MainFreq, numMain, _MaxCodeLength);
+        var distLen = _CodeLengths(DistFreq, numDist, _MaxCodeLength);
+        var mainCode = _Codes(mainLen, numMain);
+        var distCode = _Codes(distLen, numDist);
+
+        Block.Put((uint32)numMain, 17);
+        Block.Put((uint32)numDist, 6);
+        _WriteLengths(mainLen, numMain, distLen, numDist);
+
+        // every token takes less than 8 bytes
+        Block.Reserve(Count * 8 + 16);
+        unsafe
+        {
+            var w = _FastWriter { P = Block.Data[0..].Ptr(), Count = Block.Count, Bits = Block.Bits, BitCount = Block.BitCount };
+            uint32* mc = mainCode[0..].Ptr();
+            uint8* ml = mainLen[0..].Ptr();
+            uint32* dcs = numDist > 0 ? distCode[0..].Ptr() : null;
+            uint8* dls = numDist > 0 ? distLen[0..].Ptr() : null;
+            for (var i = 0; i < Count; i += 1)
+            {
+                int s = SymP[i];
+                w.Put(mc[s], ml[s]);
+                if (s < _LengthCodes)
+                {
+                    int eb = _BucketExtraBits(s);
+                    if (eb > 0)
+                        w.Put((uint32)(ValueP[i] - _BucketBase(s)), eb);
+                    int d = DistP[i];
+                    int dc = _BucketCode(d);
+                    w.Put(dcs[dc], dls[dc]);
+                    int ebd = _BucketExtraBits(dc);
+                    if (ebd > 0)
+                        w.Put((uint32)(d - _BucketBase(dc)), ebd);
+                }
+                else if (unit == 2 && s == _LengthCodes)
+                {
+                    w.Put((uint32)ValueP[i], 16);
+                }
+            }
+            Block.Count = w.Count;
+            Block.Bits = w.Bits;
+            Block.BitCount = w.BitCount;
+        }
+        if (unit == 2 && (end - start) % 2 != 0)
+            Block.Put((uint32)data[end - 1], 8);
+        Block.Align();
+    }
+
+    // The code lengths of both codes, run-length coded with a precode (like deflate):
+    // 0..16 a length, 17 + 3 bits: 3..10 zeros, 18 + 7 bits: 11..138 zeros, 19 + 2 bits: the previous length 3..6
+    // more times.
+    void _WriteLengths(uint8[] mainLen, int numMain, uint8[] distLen, int numDist)
+    {
+        int total = numMain + numDist;
+        var all = new int[total];
+        for (var i = 0; i < numMain; i += 1)
+            all[i] = mainLen[i];
+        for (var i = 0; i < numDist; i += 1)
+            all[numMain + i] = distLen[i];
+
+        var ops = new int[total];   // symbol | extra << 8
+        int opCount = 0;
+        var freq = new int[_PreCodes];
+        int at = 0;
+        while (at < total)
+        {
+            int len = all[at];
+            int run = 1;
+            while (at + run < total && all[at + run] == len)
+                run += 1;
+            at += run;
+            if (len == 0)
+            {
+                while (run >= 11)
+                {
+                    int k = Math.Min(run, 138);
+                    ops[opCount] = 18 | ((k - 11) << 8);
+                    opCount += 1;
+                    freq[18] += 1;
+                    run -= k;
+                }
+                if (run >= 3)
+                {
+                    ops[opCount] = 17 | ((run - 3) << 8);
+                    opCount += 1;
+                    freq[17] += 1;
+                    run = 0;
+                }
+            }
+            else
+            {
+                ops[opCount] = len;
+                opCount += 1;
+                freq[len] += 1;
+                run -= 1;
+                while (run >= 3)
+                {
+                    int k = Math.Min(run, 6);
+                    ops[opCount] = 19 | ((k - 3) << 8);
+                    opCount += 1;
+                    freq[19] += 1;
+                    run -= k;
+                }
+            }
+            while (run > 0)
+            {
+                ops[opCount] = len;
+                opCount += 1;
+                freq[len] += 1;
+                run -= 1;
+            }
+        }
+
+        var preLen = _CodeLengths(freq, _PreCodes, _PreMaxLength);
+        var preCode = _Codes(preLen, _PreCodes);
+        for (var s = 0; s < _PreCodes; s += 1)
+            Block.Put((uint32)preLen[s], 3);
+        for (var j = 0; j < opCount; j += 1)
+        {
+            int sym = ops[j] & 0xFF;
+            Block.Put(preCode[sym], preLen[sym]);
+            if (sym == 17)
+                Block.Put((uint32)(ops[j] >> 8), 3);
+            else if (sym == 18)
+                Block.Put((uint32)(ops[j] >> 8), 7);
+            else if (sym == 19)
+                Block.Put((uint32)(ops[j] >> 8), 2);
+        }
+    }
+}
+
+// The match finder: hash chains over the input, read through pointers (the hot loop of the compression).
+struct _Matcher
+{
+    uint8* P;
+    int Length;
+    int* Head;
+    int* Prev;
+    int PrevMask;
+    int Window;
+    int HashShift;
+    int Unit;
+    int Chain;
+    int Nice;
+    int NextInsert;
+    int FarMinMatch;
+
+    // Enters the positions up to `pos` into the hash chains and returns the longest match at pos (in units, 0 if
+    // none), its distance (in units) in `dist`.
+    unsafe int FindAt(int pos, int limit, ref int dist)
+    {
+        int q = NextInsert;
+        if (Unit == 2 && (q & 1) != 0)
+            q += 1;
+        if (q < pos - Window)
+            q = pos - Window;
+        while (q < pos)
+        {
+            _Insert(q);
+            q += Unit;
+        }
+        int candidate = _Insert(pos);
+        NextInsert = pos + Unit;
+        return _Longest(pos, candidate, limit, ref dist);
+    }
+
+    // Enters pos into the hash chains; the previous position with the same hash, or -1.
+    unsafe int _Insert(int pos)
+    {
+        if (pos + 4 > Length)
+            return -1;
+        int h = 0;
+        unchecked
+        {
+            h = (int)((_Load32(P + pos) * 2654435761u) >> HashShift);
+        }
+        int candidate = Head[h];
+        Prev[pos & PrevMask] = candidate;
+        Head[h] = pos;
+        return candidate;
+    }
+
+    // The longest match at pos among the chain from `candidate` (in units, at least _MinMatchBytes long, 0 if none).
+    unsafe int _Longest(int pos, int candidate, int limit, ref int dist)
+    {
+        int maxLen = Math.Min(limit - pos, _MaxMatchUnits * Unit);
+        if (maxLen < _MinMatchBytes)
+            return 0;
+        int best = _MinMatchBytes - 1;
+        int bestDist = 0;
+        int low = pos - Window;
+        uint8* here = P + pos;
+        uint32 first = _Load32(here);
+        int cur = candidate;
+        int tries = Chain;
+        int odd = Unit - 1;
+        while (cur > low && cur >= 0 && tries > 0)
+        {
+            uint8* there = P + cur;
+            if (((pos - cur) & odd) == 0 && there[best] == here[best] && _Load32(there) == first)
+            {
+                int len = 4 + _MatchLength(there + 4, here + 4, maxLen - 4);
+                len &= ~odd;
+                // a match of the minimum length that is far away costs more bits than its literals
+                if (len > best && (len > _MinMatchBytes || pos - cur <= FarMinMatch))
+                {
+                    best = len;
+                    bestDist = pos - cur;
+                    if (len >= Nice || len >= maxLen)
+                        break;
+                }
+            }
+            tries -= 1;
+            int next = Prev[cur & PrevMask];
+            if (next >= cur)
+                break;
+            cur = next;
+        }
+        if (bestDist == 0)
+            return 0;
+        dist = bestDist / Unit;
+        return best / Unit;
+    }
+}
+
+// How many bytes at a and b are equal, at most max; compares 8 bytes at a time.
+unsafe int _MatchLength(uint8* a, uint8* b, int max)
+{
+    int n = 0;
+    while (n + 8 <= max)
+    {
+        uint64 x = _Load64(a + n) ^ _Load64(b + n);
+        if (x != 0)
+        {
+            if ((x & 0xFFFFFFFFul) == 0)
+            {
+                n += 4;
+                x >>= 32;
+            }
+            while ((x & 0xFF) == 0)
+            {
+                n += 1;
+                x >>= 8;
+            }
+            return n;
+        }
+        n += 8;
+    }
+    while (n < max && a[n] == b[n])
+        n += 1;
+    return n;
+}
+
+// Little-endian loads byte by byte (no unaligned access on CPUs that do not allow it; clang makes one load of it
+// where they are allowed).
+unsafe uint32 _Load32(uint8* p)
+{
+    return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+unsafe uint64 _Load64(uint8* p)
+{
+    return (uint64)_Load32(p) | ((uint64)_Load32(p + 4) << 32);
+}

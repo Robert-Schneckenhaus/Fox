@@ -1,0 +1,148 @@
+using System;
+using System.Compression;
+using FoxCompression;
+
+void Usage()
+{
+    Console.WriteLine("fox c [-0..-9] [--bytes|--words] <input> <output>   compress");
+    Console.WriteLine("fox d <input> <output>                             decompress");
+    Console.WriteLine("fox bench <file> [...]                             compare levels and modes with Deflate");
+}
+
+Error<int> Main(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Usage();
+        return 1;
+    }
+    var command = args[0];
+    if (command == "c")
+        return try Compress(args);
+    if (command == "d")
+    {
+        if (args.Length != 3)
+        {
+            Usage();
+            return 1;
+        }
+        var packed = try File.ReadAllBytes(args[1]);
+        var result = Fox.Decompress(packed);
+        if (result is error e)
+            return error($"{args[1]}: {e.Message}");
+        try File.WriteAllBytes(args[2], try result);
+        return 0;
+    }
+    if (command == "bench")
+    {
+        for (var i = 1; i < args.Length; i += 1)
+            try Bench(args[i]);
+        return 0;
+    }
+    Usage();
+    return 1;
+}
+
+Error<int> Compress(string[] args)
+{
+    int level = FoxDefaultLevel;
+    var mode = FoxMode.Auto;
+    var files = List<string>.Create();
+    for (var i = 1; i < args.Length; i += 1)
+    {
+        var a = args[i];
+        if (a == "--bytes")
+            mode = FoxMode.Bytes;
+        else if (a == "--words")
+            mode = FoxMode.Words;
+        else if (a.Length == 2 && a[0] == '-' && a[1] >= '0' && a[1] <= '9')
+            level = a[1] - '0';
+        else
+            files.Add(a);
+    }
+    if (files.Count() != 2)
+    {
+        Usage();
+        return 1;
+    }
+    var data = try File.ReadAllBytes(files[0]);
+    var packed = Fox.Compress(data, level, mode);
+    try File.WriteAllBytes(files[1], packed);
+    Console.WriteLine($"{data.Length} -> {packed.Length} bytes ({Percent(packed.Length, data.Length)})");
+    return 0;
+}
+
+string Percent(int part, int whole)
+{
+    if (whole == 0)
+        return "-";
+    return (100.0 * part / whole).ToString("F1") + " %";
+}
+
+double MegabytesPerSecond(int bytes, double milliseconds)
+{
+    return milliseconds <= 0.0 ? 0.0 : bytes / 1048576.0 / (milliseconds / 1000.0);
+}
+
+// Runs `f` until about 300 ms have passed, at least twice; the best time of one run in milliseconds.
+double Measure(Func<int> f)
+{
+    double best = 1e30;
+    var total = Stopwatch.StartNew();
+    int runs = 0;
+    while (runs < 2 || total.ElapsedMilliseconds() < 300)
+    {
+        var sw = Stopwatch.StartNew();
+        f();
+        best = Math.Min(best, (double)sw.ElapsedTicks() / 10000.0);
+        runs += 1;
+    }
+    return best;
+}
+
+Error<void> Bench(string path)
+{
+    var data = try File.ReadAllBytes(path);
+    Console.WriteLine($"{path}: {data.Length} bytes");
+    Console.WriteLine($"  {"method",-16} {"size",10} {"ratio",8} {"comp MB/s",10} {"decomp MB/s",12}");
+    var levels = new int[] { 0, 1, 3, 5, 9 };
+    foreach (var level in levels)
+    {
+        var modes = level == 5 ? new FoxMode[] { FoxMode.Auto, FoxMode.Bytes, FoxMode.Words } : new FoxMode[] { FoxMode.Auto };
+        foreach (var mode in modes)
+        {
+            uint8[] packed = Fox.Compress(data, level, mode);
+            double c = Measure(() => Fox.Compress(data, level, mode).Length);
+            double d = Measure(() => {
+                if (Fox.Decompress(packed) is uint8[] back)
+                    return back.Length;
+                Environment.Panic("Fox.Decompress failed");
+                return 0;
+            });
+            string name = $"fox -{level}";
+            if (mode == FoxMode.Bytes)
+                name += " bytes";
+            else if (mode == FoxMode.Words)
+                name += " words";
+            Row(name, packed.Length, data.Length, c, d);
+        }
+    }
+    var deflateLevels = new int[] { 1, 6, 9 };
+    foreach (var level in deflateLevels)
+    {
+        uint8[] packed = Deflate.Compress(data, level);
+        double c = Measure(() => Deflate.Compress(data, level).Length);
+        double d = Measure(() => {
+            if (Deflate.Decompress(packed) is uint8[] back)
+                return back.Length;
+            return 0;
+        });
+        Row($"deflate -{level}", packed.Length, data.Length, c, d);
+    }
+    return;
+}
+
+void Row(string name, int size, int original, double compressMs, double decompressMs)
+{
+    Console.WriteLine($"  {name,-16} {size,10} {Percent(size, original),8} {MegabytesPerSecond(original, compressMs),10:F1} {MegabytesPerSecond(original, decompressMs),12:F1}");
+}
