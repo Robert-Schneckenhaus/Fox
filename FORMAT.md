@@ -42,8 +42,8 @@ big-endian 16- or 32-bit words from the highest bit down). A field of n bits has
 are canonical (like deflate): shorter codes first, equal lengths in symbol order, written from their highest bit, so a
 decoder can index a table with the top bits of its buffer.
 
-The *unit* of a block is 1 byte for type 1 and 2 bytes (a big-endian 16-bit word: the first byte is the high byte) for type 2. Lengths and
-distances are counted in units.
+The *unit* of a block is 1 byte for type 1 and 2 bytes (a big-endian 16-bit word: the first byte is the high byte)
+for type 2. Lengths and distances are counted in units.
 
 ```
 17 bits   numMain     the number of main symbols: the literal symbols + 32 match codes (see below)
@@ -95,9 +95,10 @@ it. An encoder writes `numLit` = 1 + the number of new words in the block.
 
 ### Matches
 
-A match code (0 to 31) is a *bucket code* for `length - minimum`, where the minimum is 4 units for byte blocks and
-2 units for word blocks (4 bytes either way). It is followed by its extra bits, then one distance symbol (bucket code
-for `distance - 1`) and its extra bits. The match copies `length` units starting `distance` units before the current
+A match is a main symbol from `numLit` to `numLit + 31` (256 to 287 in byte blocks). Its *length code*
+`symbol - numLit` (0 to 31) is a bucket code (below) for `length - minimum`, where the minimum is 4 units for byte
+blocks and 2 units for word blocks (4 bytes either way). The main symbol is followed by the extra bits of the length
+code, then one distance symbol (0 to 35, a bucket code for `distance - 1`) and its extra bits. The match copies `length` units starting `distance` units before the current
 position; it may overlap the bytes it writes, reach into earlier blocks, but not before the start of the data, and
 not past the end of the current block.
 
@@ -108,5 +109,5 @@ Bucket codes, for a value v:
 | 0, 1, 2, 3 | 0, 1, 2, 3 | 0 |
 | 2n + b, n >= 2 | `(2 + b) << (n - 1)` + extra | n - 1 |
 
-So 4 covers 4..5, 5 covers 6..7, 6 covers 8..11, 7 covers 12..15, and so on. Lengths use codes 0 to 31
-(`length - minimum` < 65536; encoders write at most 32768 units), distances codes 0 to 35 (`distance - 1` < 2^18).
+So 4 covers 4..5, 5 covers 6..7, 6 covers 8..11, 7 covers 12..15, and so on. Length codes are 0 to 31
+(`length - minimum` < 65536; encoders write at most 32768 units), distance symbols 0 to 35 (`distance - 1` < 2^18).
