@@ -109,17 +109,21 @@ struct _Encoder
         _Parse(data, start, end, unit, Chain, Head, Prev, _Window, _HashBits, ref NextInsert);
         _WriteBlock(data, start, end, unit);
 
-        output.Align();
+        // every block header and payload starts at an even offset (see FORMAT.md)
         if (Block.Count >= raw)
         {
             output.PutByte(_BlockStored);
-            output.PutVarint(raw);
+            output.PutByte(0);
+            output.PutU32((uint32)raw);
             output.PutBytes(data, start, raw);
+            if (raw % 2 != 0)
+                output.PutByte(0);
             return;
         }
         output.PutByte(unit == 1 ? _BlockBytes : _BlockWords);
-        output.PutVarint(raw);
-        output.PutVarint(Block.Count);
+        output.PutByte(0);
+        output.PutU32((uint32)raw);
+        output.PutU32((uint32)Block.Count);
         output.PutBytes(Block.Data, 0, Block.Count);
     }
 
@@ -276,7 +280,7 @@ struct _Encoder
         }
         else
         {
-            value = (int)p[0] | ((int)p[1] << 8);
+            value = ((int)p[0] << 8) | (int)p[1];   // big endian, as a 68000 reads it
             if (WordStampP[value] == Stamp)
             {
                 sym = _LengthCodes + 1 + WordIndexP[value];
@@ -366,7 +370,7 @@ struct _Encoder
         }
         if (unit == 2 && (end - start) % 2 != 0)
             Block.Put((uint32)data[end - 1], 8);
-        Block.Align();
+        Block.AlignEven();
     }
 
     // The code lengths of both codes, run-length coded with a precode (like deflate):

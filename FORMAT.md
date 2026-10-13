@@ -1,15 +1,20 @@
-# Fox stream format, version 1
+# Fox stream format, version 2
 
-All multi-byte integers are little endian. `varint` is an unsigned LEB128 number (7 bits per byte, lowest group
-first, the high bit set on all bytes but the last).
+All multi-byte integers are **big endian**, and every block starts at an **even offset** from the start of the
+stream, which itself has an even size. A 68000 can therefore read the whole stream in 16-bit words (it cannot read a
+word from an odd address), and a 68020 or later can refill its bit buffer with one `move.l`. Little-endian CPUs pay
+one byte swap per refill.
+
+Version 1 (the first commit) was little endian with an LSB-first bit stream and varints; it is not supported any
+more.
 
 ## Stream
 
 | Field | Size | Description |
 |---|---|---|
 | magic | 3 | `F` `O` `X` (0x46 0x4F 0x58) |
-| version | 1 | 1 |
-| size | varint | the size of the original data in bytes |
+| version | 1 | 2 |
+| size | 4 | the size of the original data in bytes |
 | blocks | ... | until `size` bytes are produced |
 | crc | 4 | CRC-32 of the original data (polynomial 0xEDB88320 reflected, as in zip, gzip and PNG) |
 
@@ -17,24 +22,27 @@ Empty data has no blocks.
 
 ## Block
 
-Every block starts at a byte boundary and covers at most 131072 (2^17) bytes of the original data.
+Every block starts at an even offset and covers at most 131072 (2^17) bytes of the original data.
 
 | Field | Size | Description |
 |---|---|---|
 | type | 1 | 0 = stored, 1 = compressed with byte literals, 2 = compressed with word literals |
-| raw | varint | the bytes of original data in this block (1 to 131072) |
-| payload | varint | compressed blocks only: the size of the bit stream in bytes |
+| reserved | 1 | 0 |
+| raw | 4 | the bytes of original data in this block (1 to 131072) |
+| payload | 4 | compressed blocks only: the size of the bit stream in bytes (always even) |
 | data | raw or payload | the bytes themselves (stored) or the bit stream |
+| padding | 0 or 1 | stored blocks with an odd `raw` only: a zero byte |
 
 A compressor writes a block stored when the bit stream would not be smaller than the data.
 
 ## Bit stream
 
-Bits are read from the lowest bit of each byte to the highest, byte after byte; a field of n bits has its lowest bit
-first. Huffman codes are canonical (like deflate): shorter codes first, equal lengths in symbol order, and their bits
-are stored from the highest code bit to the lowest (i.e. the code is bit-reversed in the stream, as in deflate).
+Bits are read MSB-first: from the highest bit of each byte to the lowest, byte after byte (the same order as reading
+big-endian 16- or 32-bit words from the highest bit down). A field of n bits has its highest bit first. Huffman codes
+are canonical (like deflate): shorter codes first, equal lengths in symbol order, written from their highest bit, so a
+decoder can index a table with the top bits of its buffer.
 
-The *unit* of a block is 1 byte for type 1 and 2 bytes (a little-endian 16-bit word) for type 2. Lengths and
+The *unit* of a block is 1 byte for type 1 and 2 bytes (a big-endian 16-bit word: the first byte is the high byte) for type 2. Lengths and
 distances are counted in units.
 
 ```
@@ -44,7 +52,7 @@ distances are counted in units.
 ...       lengths     numMain + numDist code lengths (at most 16), coded with the precode
 ...       tokens      until the block's units are complete
  8 bits   tail        word blocks with an odd raw size only: the last byte
-          padding     zero bits up to the next byte boundary
+          padding     zero bits up to the next byte boundary, then a zero byte if needed for an even size
 ```
 
 ### Code lengths

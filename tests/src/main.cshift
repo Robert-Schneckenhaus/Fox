@@ -243,8 +243,8 @@ int Main(string[] args)
     badCrc[badCrc.Length - 1] = (uint8)(badCrc[badCrc.Length - 1] ^ 1);
     Check(Fails(Fox.Decompress(badCrc), FoxError.ChecksumMismatch), "a wrong CRC is ChecksumMismatch");
     var newer = packed.Clone();
-    newer[3] = 2;
-    Check(Fails(Fox.Decompress(newer), FoxError.UnsupportedVersion), "version 2 is UnsupportedVersion");
+    newer[3] = 3;
+    Check(Fails(Fox.Decompress(newer), FoxError.UnsupportedVersion), "version 3 is UnsupportedVersion");
     Check(Fails(Fox.Decompress(new uint8[] { 1, 2, 3, 4, 5 }), FoxError.InvalidData), "garbage is InvalidData");
     Check(Fox.OriginalSize(packed) is int64 size && size == 1000, "OriginalSize reads the header");
 
@@ -253,8 +253,32 @@ int Main(string[] args)
     {
         var bytes = Text(n * 37);
         var stream = Fox.Compress(bytes);
-        uint32 stored = (uint32)stream[^4] | ((uint32)stream[^3] << 8) | ((uint32)stream[^2] << 16) | ((uint32)stream[^1] << 24);
+        uint32 stored = ((uint32)stream[^4] << 24) | ((uint32)stream[^3] << 16) | ((uint32)stream[^2] << 8) | (uint32)stream[^1];
         Check(stored == Crc32.Compute(bytes), $"CRC-32 of {bytes.Length} bytes");
+    }
+
+    // every block starts at an even offset, so a 68000 can read the stream in 16-bit words
+    foreach (var level in new int[] { 0, 5 })
+    {
+        var stream = Fox.Compress(Bitmap(333, 77, 64, 2, true), level);
+        Check(stream.Length % 2 == 0, "the stream has an even size");
+        int at = 8;
+        while (at < stream.Length - 4)
+        {
+            Check(at % 2 == 0, $"block at an even offset ({at})");
+            int raw = ((int)stream[at + 2] << 24) | ((int)stream[at + 3] << 16) | ((int)stream[at + 4] << 8) | stream[at + 5];
+            if (stream[at] == 0)
+            {
+                at += 6 + raw + raw % 2;
+            }
+            else
+            {
+                int payload = ((int)stream[at + 6] << 24) | ((int)stream[at + 7] << 16) | ((int)stream[at + 8] << 8) | stream[at + 9];
+                Check(payload % 2 == 0, "the payload has an even size");
+                at += 10 + payload;
+            }
+        }
+        Check(at == stream.Length - 4, "the blocks end before the CRC");
     }
 
     if (Failures > 0)

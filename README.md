@@ -14,6 +14,9 @@ Occurrence indeX*). Around that idea it puts what PYC was missing:
   decoding with dictionaries, and no 22-bit limit that made data incompressible.
 * **A real container**: magic, version, original size, stored blocks for incompressible data, CRC-32, and a decoder
   that rejects damaged data with an error instead of crashing.
+* **Big endian, MSB-first, 16-bit aligned** for the Amiga: every block starts at an even offset, so a 68000 decoder
+  can read the stream in words and a 68020 refill its bit buffer with one `move.l`. On x86/ARM this costs one byte
+  swap per refill.
 
 The format is specified in [FORMAT.md](FORMAT.md).
 
@@ -102,6 +105,10 @@ Speed in MB/s of original data (compress / decompress):
 | flat areas, 16 bpp | 770 / 1140 | 789 / 1261 | 201 / 1258 | 68 / 815 |
 | dithered, 16 bpp | 95 / 223 | 19 / 311 | 1 / 439 | 10 / 324 |
 | tile map | 37 / 348 | 25 / 325 | 25 / 339 | 21 / 148 |
+
+Measured with format version 1 (little endian). Version 2 (big endian, even-aligned blocks) makes the files 5 to
+60 bytes larger (fixed-size block headers and padding) and decodes 0 to 8 % slower on x86-64; on the 68k it is
+meant to be faster (not measured yet).
 
 What this shows:
 

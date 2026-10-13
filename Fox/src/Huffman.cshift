@@ -132,7 +132,8 @@ uint8[] _CodeLengths(int[] freq, int count, int maxLength)
     return lengths;
 }
 
-// The canonical codes for the lengths, bit-reversed for the writer (lowest bit first).
+// The canonical codes for the lengths (shorter codes first, equal lengths in symbol order), written highest bit
+// first.
 uint32[] _Codes(uint8[] lengths, int count)
 {
     var blCount = new int[32];
@@ -152,15 +153,8 @@ uint32[] _Codes(uint8[] lengths, int count)
         int len = lengths[sym];
         if (len == 0)
             continue;
-        uint32 c = next[len];
-        next[len] = c + 1;
-        uint32 reversed = 0;
-        for (var b = 0; b < len; b += 1)
-        {
-            reversed = (reversed << 1) | (c & 1);
-            c >>= 1;
-        }
-        codes[sym] = reversed;
+        codes[sym] = next[len];
+        next[len] += 1;
     }
     return codes;
 }
@@ -209,9 +203,9 @@ void _SiftDown(int64[] a, int start, int n)
 // ---------------------------------------------------------------------------------------------------------------
 // Decoding tables
 
-// A two-level decoding table, indexed by the next bits of the input (lowest first).
+// A two-level decoding table, indexed by the next Bits bits of the input.
 // Entry: 0 = invalid code; otherwise symbol << 6 | length (1..31), or for a code longer than Bits a link to a
-// second-level table: offset << 6 | 32 | its index bits.
+// second-level table, indexed by the bits after those: offset << 6 | 32 | its index bits.
 struct _Table
 {
     int[] Entries;
@@ -230,7 +224,7 @@ _Table _BuildTable(uint8[] lengths, int count, int primaryBits)
         maxLen = Math.Max(maxLen, (int)lengths[i]);
     }
     if (maxLen == 0)
-        return _Table { Entries = new int[1], Bits = 0 };
+        return _Table { Entries = new int[2], Bits = 1 };
     blCount[0] = 0;
     int64 left = 1;
     for (var len = 1; len <= maxLen; len += 1)
@@ -241,7 +235,6 @@ _Table _BuildTable(uint8[] lengths, int count, int primaryBits)
     }
 
     int p = Math.Min(primaryBits, maxLen);
-    int mask = (1 << p) - 1;
     var codes = _Codes(lengths, count);
     var subBits = new int[1 << p];
     for (var sym = 0; sym < count; sym += 1)
@@ -249,13 +242,13 @@ _Table _BuildTable(uint8[] lengths, int count, int primaryBits)
         int len = lengths[sym];
         if (len > p)
         {
-            int prefix = (int)codes[sym] & mask;
+            int prefix = (int)(codes[sym] >> (len - p));
             subBits[prefix] = Math.Max(subBits[prefix], len - p);
         }
     }
     int size = 1 << p;
     var offset = new int[1 << p];
-    for (var prefix = 0; prefix <= mask; prefix += 1)
+    for (var prefix = 0; prefix < 1 << p; prefix += 1)
     {
         if (subBits[prefix] > 0)
         {
@@ -264,7 +257,7 @@ _Table _BuildTable(uint8[] lengths, int count, int primaryBits)
         }
     }
     var entries = new int[size];
-    for (var prefix = 0; prefix <= mask; prefix += 1)
+    for (var prefix = 0; prefix < 1 << p; prefix += 1)
     {
         if (subBits[prefix] > 0)
             entries[prefix] = (offset[prefix] << 6) | 32 | subBits[prefix];
@@ -276,37 +269,26 @@ _Table _BuildTable(uint8[] lengths, int count, int primaryBits)
             continue;
         int code = (int)codes[sym];
         int entry = (sym << 6) | len;
+        int start = 0;
+        int fill = 0;
         if (len <= p)
         {
-            for (var i = code; i <= mask; i += 1 << len)
-                entries[i] = entry;
+            // every index that starts with the code
+            start = code << (p - len);
+            fill = 1 << (p - len);
         }
         else
         {
-            int prefix = code & mask;
-            int start = offset[prefix];
-            int end = 1 << subBits[prefix];
-            for (var i = code >> p; i < end; i += 1 << (len - p))
-                entries[start + i] = entry;
+            int prefix = code >> (len - p);
+            int restBits = len - p;
+            int sub = subBits[prefix];
+            start = offset[prefix] + ((code & ((1 << restBits) - 1)) << (sub - restBits));
+            fill = 1 << (sub - restBits);
         }
+        for (var i = 0; i < fill; i += 1)
+            entries[start + i] = entry;
     }
     return _Table { Entries = entries, Bits = p };
-}
-
-// The next symbol, or -1 for an invalid code. Codes are at most 16 bits long.
-int _Decode(ref _BitReader r, const ref _Table t)
-{
-    if (r.BitCount < 32)
-        r.Fill();
-    int e = t.Entries[(int)(r.Bits & (uint64)((1 << t.Bits) - 1))];
-    if ((e & 32) != 0)
-        e = t.Entries[(e >> 6) + (int)((r.Bits >> t.Bits) & (uint64)((1 << (e & 31)) - 1))];
-    int len = e & 31;
-    if (len == 0)
-        return -1;
-    r.Bits >>= len;
-    r.BitCount -= len;
-    return e >> 6;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

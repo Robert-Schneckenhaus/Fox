@@ -4,11 +4,14 @@ using System;
 
 FoxError<void> _ReadHeader(ref _ByteReader r)
 {
-    if (r.Byte() != 0x46 || r.Byte() != 0x4F || r.Byte() != 0x58)
-        return error(FoxError.InvalidData);
-    int version = r.Byte();
+    int f = r.U8();
+    int o = r.U8();
+    int x = r.U8();
+    int version = r.U8();
     if (version < 0)
         return error(FoxError.Truncated);
+    if (f != 0x46 || o != 0x4F || x != 0x58)
+        return error(FoxError.InvalidData);
     if (version != _FormatVersion)
         return error(FoxError.UnsupportedVersion);
     return;
@@ -18,7 +21,7 @@ FoxError<uint8[]> _Decompress(ReadOnlySlice<uint8> data)
 {
     var r = _ByteReader { Data = data };
     try _ReadHeader(ref r);
-    int64 size = r.Varint();
+    int64 size = r.U32();
     if (size < 0)
         return error(FoxError.Truncated);
     if (size > int.MaxValue)
@@ -28,26 +31,30 @@ FoxError<uint8[]> _Decompress(ReadOnlySlice<uint8> data)
     int o = 0;
     while (o < output.Length)
     {
-        int type = r.Byte();
-        int64 raw = r.Varint();
-        if (type < 0 || raw < 0)
+        int type = r.U8();
+        int reserved = r.U8();
+        int64 raw = r.U32();
+        if (raw < 0)
             return error(FoxError.Truncated);
-        if (raw == 0 || raw > _BlockSize || raw > output.Length - o)
+        if (reserved != 0 || raw == 0 || raw > _BlockSize || raw > output.Length - o)
             return error(FoxError.InvalidData);
         int rawSize = (int)raw;
         if (type == _BlockStored)
         {
-            if (rawSize > data.Length - r.Pos)
+            int padded = rawSize + rawSize % 2;
+            if (padded > data.Length - r.Pos)
                 return error(FoxError.Truncated);
             for (var i = 0; i < rawSize; i += 1)
                 output[o + i] = data[r.Pos + i];
-            r.Pos += rawSize;
+            r.Pos += padded;
         }
         else if (type == _BlockBytes || type == _BlockWords)
         {
-            int64 payload = r.Varint();
+            int64 payload = r.U32();
             if (payload < 0)
                 return error(FoxError.Truncated);
+            if (payload % 2 != 0)
+                return error(FoxError.InvalidData);
             if (payload > data.Length - r.Pos)
                 return error(FoxError.Truncated);
             int end = r.Pos + (int)payload;
@@ -60,21 +67,21 @@ FoxError<uint8[]> _Decompress(ReadOnlySlice<uint8> data)
         }
         o += rawSize;
     }
-    if (r.Pos + 4 > data.Length)
+    int64 stored = r.U32();
+    if (stored < 0)
         return error(FoxError.Truncated);
-    uint32 stored = (uint32)data[r.Pos] | ((uint32)data[r.Pos + 1] << 8) | ((uint32)data[r.Pos + 2] << 16)
-        | ((uint32)data[r.Pos + 3] << 24);
-    if (_Crc32(output) != stored)
+    if ((int64)_Crc32(output) != stored)
         return error(FoxError.ChecksumMismatch);
     return output;
 }
 
 // Decodes one compressed block into output[o .. o + raw].
-FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int raw, int unit, uint16[] dict)
+unsafe FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int raw, int unit,
+    uint16[] dict)
 {
-    var r = _BitReader { Data = src };
-    int numMain = (int)r.Take(17);
-    int numDist = (int)r.Take(6);
+    var r = _FastReader { P = src.Length > 0 ? src.Ptr() : null, Length = src.Length };
+    int numMain = (int)r.TakeChecked(17);
+    int numDist = (int)r.TakeChecked(6);
     int maxMain = unit == 1 ? _LengthCodes + 256 : _MainSymbolsMax;
     if (numMain > maxMain || numDist > _DistCodes)
         return error(FoxError.InvalidData);
@@ -82,7 +89,7 @@ FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int
     // the code lengths
     var preLen = new uint8[_PreCodes];
     for (var i = 0; i < _PreCodes; i += 1)
-        preLen[i] = (uint8)r.Take(3);
+        preLen[i] = (uint8)r.TakeChecked(3);
     var pre = _BuildTable(preLen, _PreCodes, _PreMaxLength);
     if (pre.Entries == null)
         return error(FoxError.InvalidData);
@@ -92,7 +99,9 @@ FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int
     int previous = 0;
     while (n < total)
     {
-        int sym = _Decode(ref r, pre);
+        if (r.BitCount < 32)
+            r.Refill();
+        int sym = r.Decode(pre.Entries[0..].Ptr(), pre.Bits);
         int repeat = 0;
         int value = 0;
         if (sym < 0)
@@ -107,10 +116,12 @@ FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int
         if (sym == 17)
         {
             repeat = 3 + (int)r.Take(3);
+            previous = 0;
         }
         else if (sym == 18)
         {
             repeat = 11 + (int)r.Take(7);
+            previous = 0;
         }
         else
         {
@@ -144,8 +155,7 @@ FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int
     int dictSize = 0;
     unsafe
     {
-        var f = _FastReader { P = src.Length > 0 ? src.Ptr() : null, Length = src.Length, Pos = r.Pos, Bits = r.Bits,
-            BitCount = r.BitCount, Overrun = r.Overrun };
+        var f = r;
         int* me = main.Entries[0..].Ptr();
         int mb = main.Bits;
         int* de = dists.Entries[0..].Ptr();
@@ -182,8 +192,8 @@ FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int
                         return error(FoxError.InvalidData);
                     w = dp[index];
                 }
-                out[o] = (uint8)(w & 0xFF);
-                out[o + 1] = (uint8)(w >> 8);
+                out[o] = (uint8)(w >> 8);
+                out[o + 1] = (uint8)(w & 0xFF);
                 o += 2;
                 continue;
             }
@@ -220,13 +230,10 @@ FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int o, int
             if (f.Overrun > 64)
                 return error(FoxError.Truncated);
         }
-        r.Pos = f.Pos;
-        r.Bits = f.Bits;
-        r.BitCount = f.BitCount;
-        r.Overrun = f.Overrun;
+        r = f;
     }
     if (raw % unit != 0)
-        output[o] = (uint8)r.Take(8);
+        output[o] = (uint8)r.TakeChecked(8);
     if (r.PastEnd())
         return error(FoxError.Truncated);
     return;

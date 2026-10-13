@@ -72,14 +72,11 @@ struct Fox
         output.PutByte(0x4F);   // O
         output.PutByte(0x58);   // X
         output.PutByte(_FormatVersion);
-        output.PutVarint(data.Length);
+        output.PutU32((uint32)data.Length);
         var encoder = _Encoder.Create(level, mode);
         for (var start = 0; start < data.Length; start += _BlockSize)
             encoder.CompressBlock(data, start, Math.Min(start + _BlockSize, data.Length), ref output);
-        uint32 crc = _Crc32(data);
-        output.Align();
-        for (var i = 0; i < 4; i += 1)
-            output.PutByte((int)((crc >> (8 * i)) & 0xFF));
+        output.PutU32(_Crc32(data));
         return output.ToArray();
     }
 
@@ -95,13 +92,14 @@ struct Fox
 
     /// The size of the original data of the Fox stream `data`, read from its header.
     /// @error FoxError.InvalidData `data` does not start with a Fox header.
+    /// @error FoxError.Truncated `data` ends inside the header.
     static FoxError<int64> OriginalSize(ReadOnlySlice<uint8> data)
     {
         var r = _ByteReader { Data = data };
         try _ReadHeader(ref r);
-        int64 size = r.Varint();
+        int64 size = r.U32();
         if (size < 0)
-            return error(FoxError.InvalidData);
+            return error(FoxError.Truncated);
         return size;
     }
 }
@@ -109,7 +107,7 @@ struct Fox
 // ---------------------------------------------------------------------------------------------------------------
 // Format constants (see FORMAT.md)
 
-const int _FormatVersion = 1;
+const int _FormatVersion = 2;
 
 const int _BlockStored = 0;
 const int _BlockBytes = 1;
