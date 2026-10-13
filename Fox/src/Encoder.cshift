@@ -36,15 +36,17 @@ struct _Encoder
     int[] SampleHead;
     int[] SamplePrev;
 
-    // the tokens: Sym is the main symbol; Value the length value of a match or the word of a new literal word;
-    // Dist the distance - 1 of a match (in units)
+    // the tokens: Sym is the literal symbol (0 or more) or -1 - the match code; Value the length value of a match
+    // or the word of a new literal word; Dist the distance - 1 of a match (in units). The literal symbols come first
+    // in the main alphabet, the 32 match codes after them, at a position that depends on the number of literals.
     int[] Sym;
     int[] Value;
     int[] Dist;
     int Count;
-    int[] MainFreq;
+    int[] MainFreq;    // the literal symbols
+    int[] MatchFreq;
     int[] DistFreq;
-    int MainUsed;
+    int MainUsed;      // the number of literal symbols
     int64 ExtraBits;
     int NewWords;
 
@@ -61,6 +63,7 @@ struct _Encoder
     int* ValueP;
     int* DistP;
     int* MainFreqP;
+    int* MatchFreqP;
     int* DistFreqP;
     int* WordIndexP;
     int* WordStampP;
@@ -81,6 +84,7 @@ struct _Encoder
             Value = new int[_BlockSize],
             Dist = new int[_BlockSize],
             MainFreq = new int[_MainSymbolsMax],
+            MatchFreq = new int[_MatchCodes],
             DistFreq = new int[_DistCodes],
             WordIndex = new int[65536],
             WordStamp = new int[65536],
@@ -94,6 +98,7 @@ struct _Encoder
             e.ValueP = e.Value[0..].Ptr();
             e.DistP = e.Dist[0..].Ptr();
             e.MainFreqP = e.MainFreq[0..].Ptr();
+            e.MatchFreqP = e.MatchFreq[0..].Ptr();
             e.DistFreqP = e.DistFreq[0..].Ptr();
             e.WordIndexP = e.WordIndex[0..].Ptr();
             e.WordStampP = e.WordStamp[0..].Ptr();
@@ -164,28 +169,31 @@ struct _Encoder
     double _EstimateBits()
     {
         double bits = (double)ExtraBits + 16.0 * NewWords;
-        bits += _Entropy(MainFreq, MainUsed) + _Entropy(DistFreq, _DistCodes);
+        int64 mainTotal = _Total(MainFreq, MainUsed) + _Total(MatchFreq, _MatchCodes);
+        bits += _Entropy(MainFreq, MainUsed, mainTotal) + _Entropy(MatchFreq, _MatchCodes, mainTotal);
+        bits += _Entropy(DistFreq, _DistCodes, _Total(DistFreq, _DistCodes));
         return bits;
     }
 
-    double _Entropy(int[] freq, int count)
+    int64 _Total(int[] freq, int count)
     {
         int64 total = 0;
-        int used = 0;
         for (var i = 0; i < count; i += 1)
-        {
             total += freq[i];
-            if (freq[i] > 0)
-                used += 1;
-        }
+        return total;
+    }
+
+    // The bits of the symbols of `freq` in an alphabet with `total` symbols in all.
+    double _Entropy(int[] freq, int count, int64 total)
+    {
         if (total == 0)
             return 0.0;
         double t = (double)total;
-        double bits = 5.0 * used;
+        double bits = 0.0;
         for (var i = 0; i < count; i += 1)
         {
             if (freq[i] > 0)
-                bits += freq[i] * Math.Log2(t / freq[i]);
+                bits += 5.0 + freq[i] * Math.Log2(t / freq[i]);
         }
         return bits;
     }
@@ -199,6 +207,8 @@ struct _Encoder
             MainFreq[i] = 0;
         for (var i = 0; i < _DistCodes; i += 1)
             DistFreq[i] = 0;
+        for (var i = 0; i < _MatchCodes; i += 1)
+            MatchFreq[i] = 0;
         Count = 0;
         ExtraBits = 0;
         NewWords = 0;
@@ -206,7 +216,7 @@ struct _Encoder
         Stamp += 1;
         if (end <= start)
         {
-            MainUsed = _LengthCodes + (unit == 1 ? 256 : 1);
+            MainUsed = unit == 1 ? 256 : 1;
             return;
         }
 
@@ -265,7 +275,7 @@ struct _Encoder
             }
         }
         nextInsert = m.NextInsert;
-        MainUsed = _LengthCodes + (unit == 1 ? 256 : 1 + DictSize);
+        MainUsed = unit == 1 ? 256 : 1 + DictSize;
     }
 
     unsafe void _Literal(ReadOnlySlice<uint8> data, int pos, int unit)
@@ -276,14 +286,14 @@ struct _Encoder
         if (unit == 1)
         {
             value = p[0];
-            sym = _LengthCodes + value;
+            sym = value;
         }
         else
         {
             value = ((int)p[0] << 8) | (int)p[1];   // big endian, as a 68000 reads it
             if (WordStampP[value] == Stamp)
             {
-                sym = _LengthCodes + 1 + WordIndexP[value];
+                sym = 1 + WordIndexP[value];
             }
             else
             {
@@ -291,7 +301,7 @@ struct _Encoder
                 WordStampP[value] = Stamp;
                 WordIndexP[value] = DictSize;
                 DictSize += 1;
-                sym = _LengthCodes;
+                sym = 0;
                 NewWords += 1;
             }
         }
@@ -306,11 +316,11 @@ struct _Encoder
         int v = length - minUnits;
         int code = _BucketCode(v);
         int distCode = _BucketCode(dist - 1);
-        SymP[Count] = code;
+        SymP[Count] = -1 - code;
         ValueP[Count] = v;
         DistP[Count] = dist - 1;
         Count += 1;
-        MainFreqP[code] += 1;
+        MatchFreqP[code] += 1;
         DistFreqP[distCode] += 1;
         ExtraBits += _BucketExtraBits(code) + _BucketExtraBits(distCode);
     }
@@ -319,13 +329,16 @@ struct _Encoder
     void _WriteBlock(ReadOnlySlice<uint8> data, int start, int end, int unit)
     {
         Block.Reset();
-        int numMain = MainUsed;
-        while (numMain > 0 && MainFreq[numMain - 1] == 0)
-            numMain -= 1;
+        // the main alphabet: the literal symbols, then the match codes
+        int numLit = MainUsed;
+        int numMain = numLit + _MatchCodes;
+        var mainFreq = new int[numMain];
+        Array.Copy(MainFreq, 0, mainFreq, 0, numLit);
+        Array.Copy(MatchFreq, 0, mainFreq, numLit, _MatchCodes);
         int numDist = _DistCodes;
         while (numDist > 0 && DistFreq[numDist - 1] == 0)
             numDist -= 1;
-        var mainLen = _CodeLengths(MainFreq, numMain, _MaxCodeLength);
+        var mainLen = _CodeLengths(mainFreq, numMain, _MaxCodeLength);
         var distLen = _CodeLengths(DistFreq, numDist, _MaxCodeLength);
         var mainCode = _Codes(mainLen, numMain);
         var distCode = _Codes(distLen, numDist);
@@ -346,22 +359,25 @@ struct _Encoder
             for (var i = 0; i < Count; i += 1)
             {
                 int s = SymP[i];
-                w.Put(mc[s], ml[s]);
-                if (s < _LengthCodes)
+                if (s >= 0)
                 {
-                    int eb = _BucketExtraBits(s);
+                    w.Put(mc[s], ml[s]);
+                    if (unit == 2 && s == 0)
+                        w.Put((uint32)ValueP[i], 16);
+                }
+                else
+                {
+                    int code = -1 - s;
+                    w.Put(mc[numLit + code], ml[numLit + code]);
+                    int eb = _BucketExtraBits(code);
                     if (eb > 0)
-                        w.Put((uint32)(ValueP[i] - _BucketBase(s)), eb);
+                        w.Put((uint32)(ValueP[i] - _BucketBase(code)), eb);
                     int d = DistP[i];
                     int dc = _BucketCode(d);
                     w.Put(dcs[dc], dls[dc]);
                     int ebd = _BucketExtraBits(dc);
                     if (ebd > 0)
                         w.Put((uint32)(d - _BucketBase(dc)), ebd);
-                }
-                else if (unit == 2 && s == _LengthCodes)
-                {
-                    w.Put((uint32)ValueP[i], 16);
                 }
             }
             Block.Count = w.Count;

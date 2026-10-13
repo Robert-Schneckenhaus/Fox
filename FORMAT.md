@@ -1,19 +1,19 @@
-# Fox stream format, version 2
+# Fox stream format, version 0 (draft)
 
 All multi-byte integers are **big endian**, and every block starts at an **even offset** from the start of the
 stream, which itself has an even size. A 68000 can therefore read the whole stream in 16-bit words (it cannot read a
 word from an odd address), and a 68020 or later can refill its bit buffer with one `move.l`. Little-endian CPUs pay
 one byte swap per refill.
 
-Version 1 (the first commit) was little endian with an LSB-first bit stream and varints; it is not supported any
-more.
+**Version 0 is a draft:** the format may still change without a new version number until it is declared final
+(version 1). Streams from an earlier commit may not be readable by a later one.
 
 ## Stream
 
 | Field | Size | Description |
 |---|---|---|
 | magic | 3 | `F` `O` `X` (0x46 0x4F 0x58) |
-| version | 1 | 2 |
+| version | 1 | 0 (the draft) |
 | size | 4 | the size of the original data in bytes |
 | blocks | ... | until `size` bytes are produced |
 | crc | 4 | CRC-32 of the original data (polynomial 0xEDB88320 reflected, as in zip, gzip and PNG) |
@@ -46,7 +46,7 @@ The *unit* of a block is 1 byte for type 1 and 2 bytes (a big-endian 16-bit word
 distances are counted in units.
 
 ```
-17 bits   numMain     the number of main symbols with a code length (the rest have length 0)
+17 bits   numMain     the number of main symbols: the literal symbols + 32 match codes (see below)
  6 bits   numDist     the number of distance symbols with a code length (0 to 36)
 20 x 3    precode     the code lengths of the 20 precode symbols (0 = unused, at most 7)
 ...       lengths     numMain + numDist code lengths (at most 16), coded with the precode
@@ -71,19 +71,31 @@ length 1); their unused bit patterns are invalid in the data.
 
 ### Main symbols
 
-| Symbol | Byte blocks | Word blocks |
-|---|---|---|
-| 0 to 31 | match, length code | match, length code |
-| 32 to 287 | literal byte `symbol - 32` | |
-| 32 | | **new word**: 16 bits follow, the word itself; it is appended to the block's dictionary |
-| 33 to 32 + 65536 | | **known word**: dictionary entry `symbol - 33` (must already exist) |
+The literal symbols come first, so the most frequent symbols need no arithmetic; the 32 match codes are the last
+symbols of the main alphabet. With `numLit = numMain - 32`:
 
-The dictionary of a word block starts empty, so its words are numbered in the order of their first occurrence as a
-literal: the FOX scheme (*First Occurrence indeX*). Words that are only copied by matches are not in it.
+**Byte blocks** (`numMain` must be 288):
+
+| Symbol | Meaning |
+|---|---|
+| 0 to 255 | the literal byte with this value |
+| 256 to 287 | a match, length code `symbol - 256` |
+
+**Word blocks** (`numMain` from 33 to 65569):
+
+| Symbol | Meaning |
+|---|---|
+| 0 | **new word**: 16 bits follow, the word itself; it becomes the next dictionary entry |
+| 1 to numLit - 1 | **known word**: dictionary entry `symbol` (must already exist) |
+| numLit to numLit + 31 | a match, length code `symbol - numLit` |
+
+The dictionary of a word block starts empty and counts from 1, so its words are numbered in the order of their first
+occurrence as a literal: the FOX scheme (*First Occurrence indeX*). Words that are only copied by matches are not in
+it. An encoder writes `numLit` = 1 + the number of new words in the block.
 
 ### Matches
 
-A match symbol (0 to 31) is a *bucket code* for `length - minimum`, where the minimum is 4 units for byte blocks and
+A match code (0 to 31) is a *bucket code* for `length - minimum`, where the minimum is 4 units for byte blocks and
 2 units for word blocks (4 bytes either way). It is followed by its extra bits, then one distance symbol (bucket code
 for `distance - 1`) and its extra bits. The match copies `length` units starting `distance` units before the current
 position; it may overlap the bytes it writes, reach into earlier blocks, but not before the start of the data, and

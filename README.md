@@ -18,7 +18,7 @@ Occurrence indeX*). Around that idea it puts what PYC was missing:
   can read the stream in words and a 68020 refill its bit buffer with one `move.l`. On x86/ARM this costs one byte
   swap per refill.
 
-The format is specified in [FORMAT.md](FORMAT.md).
+The format is specified in [FORMAT.md](FORMAT.md). It is still a draft (version 0) and may change.
 
 ## Usage
 
@@ -106,9 +106,9 @@ Speed in MB/s of original data (compress / decompress):
 | dithered, 16 bpp | 95 / 223 | 19 / 311 | 1 / 439 | 10 / 324 |
 | tile map | 37 / 348 | 25 / 325 | 25 / 339 | 21 / 148 |
 
-Measured with format version 1 (little endian). Version 2 (big endian, even-aligned blocks) makes the files 5 to
-60 bytes larger (fixed-size block headers and padding) and decodes 0 to 8 % slower on x86-64; on the 68k it is
-meant to be faster (not measured yet).
+Measured with an earlier draft of the format (little endian). The current draft (big endian, even-aligned blocks)
+makes the files 5 to 60 bytes larger (fixed-size block headers and padding) and decodes 0 to 8 % slower on x86-64;
+on the 68k it is meant to be faster (not measured yet).
 
 What this shows:
 

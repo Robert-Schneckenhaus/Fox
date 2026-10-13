@@ -107,7 +107,7 @@ struct Fox
 // ---------------------------------------------------------------------------------------------------------------
 // Format constants (see FORMAT.md)
 
-const int _FormatVersion = 2;
+const int _FormatVersion = 0;   // 0 = draft: the format may still change (see FORMAT.md)
 
 const int _BlockStored = 0;
 const int _BlockBytes = 1;
@@ -119,9 +119,9 @@ const int _MinMatchBytes = 4;
 const int _MaxMatchUnits = 32768;
 const int _SampleSize = 16384;         // the part of a block that decides between byte and word literals
 
-const int _LengthCodes = 32;           // match length - minimum < 2^16
+const int _MatchCodes = 32;            // match length - minimum < 2^16; the last main symbols
 const int _DistCodes = 36;             // distance - 1 < 2^18
-const int _MainSymbolsMax = _LengthCodes + 1 + 65536;
+const int _MainSymbolsMax = 1 + 65536 + _MatchCodes;
 const int _MaxCodeLength = 16;
 const int _PreCodes = 20;
 const int _PreMaxLength = 7;

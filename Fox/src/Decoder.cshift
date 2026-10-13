@@ -27,7 +27,7 @@ FoxError<uint8[]> _Decompress(ReadOnlySlice<uint8> data)
     if (size > int.MaxValue)
         return error(FoxError.InvalidData);
     var output = new uint8[(int)size];
-    var dict = new uint16[65536];
+    var dict = new uint16[65537];   // entries 1 to 65536
     int o = 0;
     while (o < output.Length)
     {
@@ -82,9 +82,12 @@ unsafe FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int
     var r = _FastReader { P = src.Length > 0 ? src.Ptr() : null, Length = src.Length };
     int numMain = (int)r.TakeChecked(17);
     int numDist = (int)r.TakeChecked(6);
-    int maxMain = unit == 1 ? _LengthCodes + 256 : _MainSymbolsMax;
-    if (numMain > maxMain || numDist > _DistCodes)
+    // the literal symbols, then the match codes: 256 + 32 for bytes, 1 + the dictionary + 32 for words
+    if (unit == 1 ? numMain != 256 + _MatchCodes : (numMain < 1 + _MatchCodes || numMain > _MainSymbolsMax))
         return error(FoxError.InvalidData);
+    if (numDist > _DistCodes)
+        return error(FoxError.InvalidData);
+    int numLit = numMain - _MatchCodes;
 
     // the code lengths
     var preLen = new uint8[_PreCodes];
@@ -170,35 +173,36 @@ unsafe FoxError<void> _DecodeBlock(ReadOnlySlice<uint8> src, uint8[] output, int
             int s = f.Decode(me, mb);
             if (s < 0)
                 return error(FoxError.InvalidData);
-            if (s >= _LengthCodes)
+            if (s < numLit)
             {
                 if (unit == 1)
                 {
-                    out[o] = (uint8)(s - _LengthCodes);
+                    out[o] = (uint8)s;
                     o += 1;
                     continue;
                 }
+                // the dictionary counts from 1, so a known word's symbol is its index
                 uint32 w = 0;
-                if (s == _LengthCodes)
+                if (s == 0)
                 {
                     w = f.Take(16);
-                    dp[dictSize] = (uint16)w;
                     dictSize += 1;
+                    dp[dictSize] = (uint16)w;
                 }
                 else
                 {
-                    int index = s - _LengthCodes - 1;
-                    if (index >= dictSize)
+                    if (s > dictSize)
                         return error(FoxError.InvalidData);
-                    w = dp[index];
+                    w = dp[s];
                 }
                 out[o] = (uint8)(w >> 8);
                 out[o + 1] = (uint8)(w & 0xFF);
                 o += 2;
                 continue;
             }
-            int eb = _BucketExtraBits(s);
-            int v = _BucketBase(s) + (eb > 0 ? (int)f.Take(eb) : 0);
+            int code = s - numLit;
+            int eb = _BucketExtraBits(code);
+            int v = _BucketBase(code) + (eb > 0 ? (int)f.Take(eb) : 0);
             int len = (v + minUnits) * unit;
             if (f.BitCount < 32)
                 f.Refill();
